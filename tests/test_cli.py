@@ -250,6 +250,231 @@ class LedgerCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("register", result.stdout)
         self.assertIn("query", result.stdout)
+        self.assertIn("transfer", result.stdout)
+        self.assertIn("transfer-query", result.stdout)
+
+
+class TransferCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed(self, cwd: Path) -> None:
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", str(cwd / "ledger.db"),
+            "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            "--batch", "LOT-2,2024-04-02,2025-04-02,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_submit_then_query_then_source_is_drawn_down(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-001",
+                "--from", " WH-A ", "--to", "WH-B", "--product", "SKU-1001",
+                "--db", db,
+                "--item", "LOT-1,10",
+                "--item", " LOT-2 , 12 ",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单号=TR-001", result.stdout)
+            self.assertIn("来源仓=WH-A", result.stdout)
+            self.assertIn("目标仓=WH-B", result.stdout)
+            self.assertIn("状态=in_transit", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单号=TR-001", result.stdout)
+            self.assertIn("来源仓=WH-A", result.stdout)
+            self.assertIn("目标仓=WH-B", result.stdout)
+            self.assertIn("商品=SKU-1001", result.stdout)
+            self.assertIn("状态=in_transit", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=10", result.stdout)
+            self.assertIn("批次号=LOT-2 调出数量=12", result.stdout)
+
+            result = self.invoke_in(
+                cwd, "query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertIn("数量=8", result.stdout)
+            self.assertIn("数量=0", result.stdout)
+
+            # Target warehouse is not credited yet.
+            result = self.invoke_in(
+                cwd, "query", "--warehouse", "WH-B",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertIn("批次总数=0", result.stdout)
+
+    def test_query_missing_order_returns_empty_with_zero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "NOPE",
+                "--db", str(cwd / "ledger.db")
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单号=NOPE", result.stdout)
+            self.assertIn("批次数=0", result.stdout)
+            self.assertFalse((cwd / "ledger.db").exists())
+
+    def test_duplicate_order_rejected_without_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+            self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-001", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,2",
+            )
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-001", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,3",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TR-001", result.stderr)
+            self.assertIn("唯一", result.stderr)
+
+            result = self.invoke_in(
+                cwd, "query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            # Still 16 (18 - 2), not 13.
+            self.assertIn("数量=16", result.stdout)
+
+    def test_source_must_differ_from_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-002", "--from", "WH-A",
+                "--to", " WH-A ", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("不得与来源仓", result.stderr)
+
+    def test_unknown_lot_and_insufficient_quantity_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-003", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-X,1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("LOT-X", result.stderr)
+            self.assertIn("落账", result.stderr)
+
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-004", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,99",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("超过现存数量 18", result.stderr)
+
+            result = self.invoke_in(
+                cwd, "query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertIn("数量=18", result.stdout)
+
+    def test_duplicate_lot_in_one_order_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-005", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,1",
+                "--item", "LOT-1,2",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("批次分配行 2", result.stderr)
+            self.assertIn("重复", result.stderr)
+
+    def test_invalid_item_lines_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+            cases = [
+                ("LOT-1,0", "正整数"),
+                ("LOT-1,-4", "正整数"),
+                ("LOT-1,x", "正整数"),
+                (" ,1", "批次号不能为空"),
+                ("LOT-1", "格式"),
+                ("LOT-1,1,9", "不接受汇总数量"),
+            ]
+            for item_line, hint in cases:
+                with self.subTest(item_line=item_line):
+                    result = self.invoke_in(
+                        cwd,
+                        "transfer", "--order", "TR-X", "--from", "WH-A",
+                        "--to", "WH-B", "--product", "SKU-1001",
+                        "--db", db, "--item", item_line,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    def test_one_bad_item_line_rejects_whole_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd)
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-006", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-2,1",
+                "--item", "LOT-1,99",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("批次分配行 2", result.stderr)
+
+            result = self.invoke_in(
+                cwd, "query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertIn("数量=18", result.stdout)
+            self.assertIn("数量=12", result.stdout)
+
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-006", "--db", db
+            )
+            self.assertIn("批次数=0", result.stdout)
 
 
 if __name__ == "__main__":
