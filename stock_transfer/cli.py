@@ -11,7 +11,12 @@ from datetime import date
 from pathlib import Path
 
 from . import __version__
-from .ledger import DEFAULT_DB_FILENAME, BatchInput, Ledger
+from .ledger import (
+    DEFAULT_DB_FILENAME,
+    BatchInput,
+    Ledger,
+    TransferLineInput,
+)
 
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
@@ -96,10 +101,60 @@ def _validate_batches(
     return parsed, errors
 
 
+def _validate_transfer_lines(
+    raw_lines: Sequence[str],
+) -> tuple[list[tuple[int, TransferLineInput]], list[str]]:
+    """Validate every allocation line; return (line number, line) pairs and errors.
+
+    A line has the form ``批次号,调出数量`` — the quantity is the only
+    quantity on the line; no summary/total quantity is accepted. Field-level
+    errors are collected per line; callers must reject the whole submission
+    whenever the error list is non-empty.
+    """
+    parsed: list[tuple[int, TransferLineInput]] = []
+    errors: list[str] = []
+    seen_lots: dict[str, int] = {}
+
+    for index, raw in enumerate(raw_lines, start=1):
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) != 2:
+            errors.append(
+                f"调拨行 {index}: 调拨行格式错误，应为“批次号,调出数量”"
+            )
+            continue
+
+        lot, quantity_raw = parts
+        line_ok = True
+
+        if not lot:
+            errors.append(f"调拨行 {index}: 批次号不能为空")
+            line_ok = False
+
+        if not quantity_raw.isdigit() or int(quantity_raw) <= 0:
+            errors.append(
+                f"调拨行 {index}: 调出数量 {quantity_raw!r} 必须为正整数"
+            )
+            line_ok = False
+
+        if not line_ok:
+            continue
+
+        parsed.append((index, TransferLineInput(lot, int(quantity_raw))))
+        first_line = seen_lots.get(lot)
+        if first_line is None:
+            seen_lots[lot] = index
+        else:
+            errors.append(
+                f"调拨行 {index}: 批次号 {lot} 与调拨行 {first_line} 重复"
+            )
+
+    return parsed, errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记与批次查询。",
+        description="Local 多仓库存台账：库存登记、批次查询与调拨在途跟踪。",
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -107,7 +162,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "      --batch LOT-2024-001,2024-03-01,2025-03-01,18 \\\n"
             "      --batch LOT-2024-002,2024-04-02,2025-04-02,12\n"
             "  python3 -m stock_transfer query --warehouse WH-A "
-            "--product SKU-1001"
+            "--product SKU-1001\n"
+            "  python3 -m stock_transfer transfer --order TR-0001 "
+            "--source WH-A --target WH-B --product SKU-1001 \\\n"
+            "      --line LOT-2024-001,5\n"
+            "  python3 -m stock_transfer transfer-query --order TR-0001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -146,6 +205,43 @@ def _build_parser() -> argparse.ArgumentParser:
     query.add_argument("--warehouse", required=True, help="仓库代码")
     query.add_argument("--product", required=True, help="商品代码")
     query.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    transfer = subparsers.add_parser(
+        "transfer",
+        help="把指定商品按批次从来源仓调出到目标仓，生成在途调拨单",
+        description=(
+            "整单一次落账：来源仓各批次现存数量立即扣减，目标仓不立即收货，"
+            "单据状态为 in_transit、实收数量为 0；任一行不合法则整单拒绝。"
+            "调拨行格式：批次号,调出数量（正整数，为本行唯一数量含义）。"
+        ),
+    )
+    transfer.add_argument("--order", required=True, help="调拨单号（全局唯一）")
+    transfer.add_argument("--source", required=True, help="来源仓代码")
+    transfer.add_argument("--target", required=True, help="目标仓代码")
+    transfer.add_argument("--product", required=True, help="商品代码")
+    transfer.add_argument(
+        "--line",
+        required=True,
+        action="append",
+        metavar="批次号,调出数量",
+        help="批次调拨行，可重复提供以在一单内调出多个批次",
+    )
+    transfer.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    transfer_query = subparsers.add_parser(
+        "transfer-query",
+        help="按调拨单号查询调拨单状态、实收数量与各批次调出数量",
+    )
+    transfer_query.add_argument("--order", required=True, help="调拨单号")
+    transfer_query.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -232,6 +328,100 @@ def _run_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_transfer(args: argparse.Namespace) -> int:
+    order_no = args.order.strip()
+    source = args.source.strip()
+    target = args.target.strip()
+    product = args.product.strip()
+
+    errors: list[str] = []
+    if not order_no:
+        errors.append("调拨单号去首尾空白后不能为空")
+    if not source:
+        errors.append("来源仓代码去首尾空白后不能为空")
+    if not target:
+        errors.append("目标仓代码去首尾空白后不能为空")
+    if not product:
+        errors.append("商品代码去首尾空白后不能为空")
+    if source and target and source == target:
+        errors.append("目标仓不得与来源仓相同")
+
+    parsed, line_errors = _validate_transfer_lines(args.line)
+    errors.extend(line_errors)
+
+    db_path = _db_path(args)
+    if not errors:
+        with Ledger.open(db_path) as ledger:
+            if ledger.transfer_order_exists(order_no):
+                errors.append(f"调拨单号 {order_no} 已存在")
+            quantities = ledger.batch_quantities(
+                source, product, [line.lot for _, line in parsed]
+            )
+        for line_number, line in parsed:
+            current = quantities.get(line.lot)
+            if current is None:
+                errors.append(
+                    f"调拨行 {line_number}: 批次号 {line.lot} 未在来源仓 "
+                    f"{source} 商品 {product} 下落账"
+                )
+            elif line.quantity > current:
+                errors.append(
+                    f"调拨行 {line_number}: 调出数量 {line.quantity} 超出来源仓 "
+                    f"{source} 批次 {line.lot} 现存数量 {current}"
+                )
+
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    try:
+        with Ledger.open(db_path) as ledger:
+            ledger.create_transfer(
+                order_no, source, target, product,
+                [line for _, line in parsed],
+            )
+    except sqlite3.IntegrityError as exc:
+        print(f"调拨失败：{exc}", file=sys.stderr)
+        return 1
+
+    total = sum(line.quantity for _, line in parsed)
+    print(
+        f"调拨成功：单号={order_no} 来源仓={source} 目标仓={target} "
+        f"商品={product} 状态=in_transit 实收数量=0 "
+        f"调出总数量={total} 批次数={len(parsed)}"
+    )
+    return 0
+
+
+def _run_transfer_query(args: argparse.Namespace) -> int:
+    order_no = args.order.strip()
+    if not order_no:
+        print("调拨单号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    if not db_path.exists():
+        record = None
+    else:
+        with Ledger.open(db_path) as ledger:
+            record = ledger.get_transfer(order_no)
+
+    if record is None:
+        print(f"调拨单号={order_no} 无此调拨单")
+        return 0
+
+    print(
+        f"调拨单号={record.order_no} 来源仓={record.source_warehouse} "
+        f"目标仓={record.target_warehouse} 商品={record.product} "
+        f"状态={record.status} 实收数量={record.received_quantity} "
+        f"批次数={len(record.lines)}"
+    )
+    for line in record.lines:
+        print(f"批次号={line.lot} 调出数量={line.quantity}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     if argv is None:
@@ -245,5 +435,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_register(args)
     if args.command == "query":
         return _run_query(args)
+    if args.command == "transfer":
+        return _run_transfer(args)
+    if args.command == "transfer-query":
+        return _run_transfer_query(args)
     parser.print_help()
     return 0
