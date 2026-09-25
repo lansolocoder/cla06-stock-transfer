@@ -76,3 +76,27 @@ python3 -m stock_transfer receive --transfer TR-001 \
 
 重复确认或对不存在的调拨单确认均拒绝。状态字面值精确为 `shipped`、`received`、
 `received-with-diff`，不做大小写或拼写变体兼容。
+
+## 调拨取消
+
+对状态为 `shipped` 的在途调拨单做取消，整单原子处理（任一行退回不合法则整次拒绝，
+台账与调拨单状态不变）：
+
+```bash
+python3 -m stock_transfer cancel --transfer TR-001 --reason 客户撤单
+```
+
+取消按调拨行逐行把发运数量全额退回发出仓对应批次：发出仓同批次行仍在则在原行数量上
+累加，已不存在则追加新行（生产日期与有效期至沿用该批次现状）；接收仓数量保持 ship
+时已入账的数值不动。调拨单状态精确变为 `canceled`，各调拨行实收数量全部记为 0，
+与该单相关的差异不再挂账。成功后输出：
+
+```text
+取消成功：调拨单号=TR-001 退回总数=15
+```
+
+`--reason` 可选，去空白后为空则拒绝（原因仅校验非空，不参与输出）。调拨单不存在、
+状态不是 `shipped`（`received`、`received-with-diff` 及重复取消均拒绝）、
+`--transfer` 去空白后为空，统一写 stderr、退出码 1、stdout 为空且台账不变。
+取消成功后不能再对该单收货确认。状态字面值精确为 `canceled`，不做大小写或拼写变体
+兼容。

@@ -20,7 +20,6 @@ from .ledger import (
     LedgerError,
     ShipLine,
 )
-
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
@@ -154,7 +153,7 @@ def _validate_transfer_lines(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记、批次查询、调拨提交与收货确认。",
+        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认与调拨取消。",
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -167,7 +166,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "      --from WH-A --to WH-B --product SKU-1001 \\\n"
             "      --line LOT-2024-001,10\n"
             "  python3 -m stock_transfer receive --transfer TR-001 \\\n"
-            "      --line LOT-2024-001,8"
+            "      --line LOT-2024-001,8\n"
+            "  python3 -m stock_transfer cancel --transfer TR-001 "
+            "--reason 客户撤单"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -270,6 +271,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="可选实收行，可重复提供；缺省表示按发运数量全部实收",
     )
     receive.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    cancel = subparsers.add_parser(
+        "cancel",
+        help="取消状态为 shipped 的在途调拨单",
+        description=(
+            "仅状态为 shipped 的调拨单可取消。逐行把发运数量全额退回发出仓"
+            "对应批次（接收仓数量保持不动），状态精确变为 canceled，"
+            "各调拨行实收数量记为 0，差异不再挂账；任一行退回不合法则整次拒绝。"
+        ),
+    )
+    cancel.add_argument(
+        "--transfer", required=True, metavar="调拨单号", help="待取消的调拨单号"
+    )
+    cancel.add_argument(
+        "--reason",
+        default=None,
+        metavar="原因",
+        help="取消原因，去空白后不能为空（仅校验，不参与输出）",
+    )
+    cancel.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -407,6 +432,28 @@ def _run_receive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_cancel(args: argparse.Namespace) -> int:
+    transfer_no = args.transfer.strip()
+    if not transfer_no:
+        print("调拨单号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    if args.reason is not None and not args.reason.strip():
+        print("取消原因去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    try:
+        with Ledger.open(db_path) as ledger:
+            total = ledger.cancel_transfer(transfer_no)
+    except LedgerError as exc:
+        print(f"调拨取消失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(f"取消成功：调拨单号={transfer_no} 退回总数={total}")
+    return 0
+
+
 def _run_query(args: argparse.Namespace) -> int:
     warehouse = args.warehouse.strip()
     product = args.product.strip()
@@ -450,5 +497,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_ship(args)
     if args.command == "receive":
         return _run_receive(args)
+    if args.command == "cancel":
+        return _run_cancel(args)
     parser.print_help()
     return 0

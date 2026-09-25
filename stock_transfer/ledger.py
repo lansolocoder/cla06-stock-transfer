@@ -13,6 +13,7 @@ DEFAULT_DB_FILENAME = "stock_ledger.db"
 STATUS_SHIPPED = "shipped"
 STATUS_RECEIVED = "received"
 STATUS_RECEIVED_WITH_DIFF = "received-with-diff"
+STATUS_CANCELED = "canceled"
 
 
 class LedgerError(Exception):
@@ -230,6 +231,105 @@ class Ledger:
                 )
         except sqlite3.IntegrityError as exc:
             raise LedgerError(f"调拨提交失败：{exc}") from exc
+        return total
+
+    def cancel_transfer(self, transfer_no: str) -> int:
+        """Cancel a shipped transfer order; return total returned quantity.
+
+        Every line's shipped quantity is returned in full to the source
+        warehouse's matching lot (accumulating onto an existing row or
+        appending a new row that keeps the batch's current dates). The
+        destination stock stays exactly as booked at ship time. The order
+        becomes ``canceled`` with every line's received quantity set to 0
+        and no pending difference. Any violation raises LedgerError and
+        leaves the ledger and the order untouched.
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT status, source_warehouse, product "
+                    "FROM transfers WHERE transfer_no = ?",
+                    (transfer_no,),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(f"调拨单 {transfer_no} 不存在")
+                status, source, product = row
+                if status != STATUS_SHIPPED:
+                    raise LedgerError(
+                        f"调拨单 {transfer_no} 状态为 {status}，不能取消"
+                    )
+
+                lines = self._conn.execute(
+                    "SELECT lot, shipped_quantity FROM transfer_lines "
+                    "WHERE transfer_no = ? ORDER BY seq",
+                    (transfer_no,),
+                ).fetchall()
+
+                # Validate every return before touching any row, so an
+                # illegal line rejects the whole cancellation.
+                returns: list[tuple[str, int, str, str]] = []
+                for lot, shipped_qty in lines:
+                    source_row = self._conn.execute(
+                        "SELECT production_date, expiry_date "
+                        "FROM stock_batches "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (source, product, lot),
+                    ).fetchone()
+                    if source_row is not None:
+                        production_date, expiry_date = source_row
+                    else:
+                        # The source row was fully consumed at ship time, so
+                        # the returned quantity is appended as a new row and
+                        # keeps the batch's current dates wherever it now
+                        # lives (prefer the order's destination warehouse).
+                        batch_row = self._conn.execute(
+                            "SELECT sb.production_date, sb.expiry_date "
+                            "FROM stock_batches sb "
+                            "WHERE sb.product = ? AND sb.lot = ? "
+                            "ORDER BY CASE WHEN sb.warehouse = "
+                            "    (SELECT dest_warehouse FROM transfers "
+                            "     WHERE transfer_no = ?) THEN 0 ELSE 1 END, "
+                            "sb.id LIMIT 1",
+                            (product, lot, transfer_no),
+                        ).fetchone()
+                        if batch_row is None:
+                            raise LedgerError(
+                                f"批次 {lot} 在台账中无现存批次，无法退回发出仓 "
+                                f"{source}"
+                            )
+                        production_date, expiry_date = batch_row
+                    returns.append((lot, shipped_qty, production_date, expiry_date))
+
+                for lot, shipped_qty, production_date, expiry_date in returns:
+                    self._conn.execute(
+                        "INSERT INTO stock_batches "
+                        "(warehouse, product, lot, production_date, expiry_date, "
+                        " quantity) VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT (warehouse, product, lot) "
+                        "DO UPDATE SET quantity = quantity + excluded.quantity",
+                        (
+                            source,
+                            product,
+                            lot,
+                            production_date,
+                            expiry_date,
+                            shipped_qty,
+                        ),
+                    )
+
+                total = sum(shipped_qty for _, shipped_qty, _, _ in returns)
+                self._conn.execute(
+                    "UPDATE transfer_lines SET received_quantity = 0 "
+                    "WHERE transfer_no = ?",
+                    (transfer_no,),
+                )
+                self._conn.execute(
+                    "UPDATE transfers SET status = ?, diff_total = 0 "
+                    "WHERE transfer_no = ?",
+                    (STATUS_CANCELED, transfer_no),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"调拨取消失败：{exc}") from exc
         return total
 
     def confirm_receipt(

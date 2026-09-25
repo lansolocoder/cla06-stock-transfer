@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -446,6 +447,295 @@ class TransferCommandTests(unittest.TestCase):
             result = self.receive(cwd, "TR-1")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("received", result.stdout)
+
+
+class CancelCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", "SKU-1",
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def ship(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "ship", "--transfer", transfer,
+            "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+        ]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def receive(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = ["receive", "--transfer", transfer]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def cancel(self, cwd: Path, transfer: str, reason: str | None = "客户撤单",
+               db: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = ["cancel", "--transfer", transfer]
+        if reason is not None:
+            arguments += ["--reason", reason]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def query_quantities(self, cwd: Path, warehouse: str) -> dict[str, int]:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", "SKU-1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        quantities: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            match = re.match(r"批次号=(\S+) .*数量=(\d+)$", line)
+            if match:
+                quantities[match[1]] = int(match[2])
+        return quantities
+
+    def query_batch(self, cwd: Path, warehouse: str, lot: str) -> tuple[str, str, int] | None:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", "SKU-1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(
+            rf"批次号={lot} 生产日期=(\S+) 有效期至=(\S+) 数量=(\d+)",
+            result.stdout,
+        )
+        if match is None:
+            return None
+        return match[1], match[2], int(match[3])
+
+    def order_state(self, cwd: Path, transfer: str) -> tuple[str, int, dict[str, int | None]]:
+        conn = sqlite3.connect(cwd / "stock_ledger.db")
+        try:
+            row = conn.execute(
+                "SELECT status, diff_total FROM transfers WHERE transfer_no = ?",
+                (transfer,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            status, diff_total = row
+            lines = {
+                lot: received
+                for lot, received in conn.execute(
+                    "SELECT lot, received_quantity FROM transfer_lines "
+                    "WHERE transfer_no = ? ORDER BY seq",
+                    (transfer,),
+                )
+            }
+        finally:
+            conn.close()
+        return status, diff_total, lines
+
+    def test_cancel_returns_quantities_and_freezes_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.ship(cwd, "TR-1", "LOT-1,6", "LOT-2,8").returncode, 0
+            )
+            # LOT-2 was fully shipped, so its source row no longer exists.
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {"LOT-1": 4})
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-B"), {"LOT-1": 6, "LOT-2": 8}
+            )
+
+            result = self.cancel(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                result.stdout.strip(), "取消成功：调拨单号=TR-1 退回总数=14"
+            )
+
+            # Everything shipped is back at the source; LOT-2 is appended as a
+            # new row keeping the batch's current dates.
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-A"), {"LOT-1": 10, "LOT-2": 8}
+            )
+            self.assertEqual(
+                self.query_batch(cwd, "WH-A", "LOT-2"),
+                ("2024-04-02", "2025-04-02", 8),
+            )
+            # The destination keeps exactly what ship booked.
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-B"), {"LOT-1": 6, "LOT-2": 8}
+            )
+
+            status, diff_total, lines = self.order_state(cwd, "TR-1")
+            self.assertEqual(status, "canceled")
+            self.assertEqual(diff_total, 0)
+            self.assertEqual(lines, {"LOT-1": 0, "LOT-2": 0})
+
+    def test_cancel_accumulates_onto_remaining_source_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            # Other movements on the same lot must not be disturbed by the
+            # accumulation (pre-existing source row just gets the return added).
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(self.ship(cwd, "TR-2", "LOT-1,1").returncode, 0)
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {"LOT-1": 3})
+
+            result = self.cancel(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("退回总数=6", result.stdout)
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {"LOT-1": 9})
+            # TR-1's destination booking stays put.
+            self.assertEqual(self.query_quantities(cwd, "WH-B"), {"LOT-1": 7})
+
+    def test_cancel_without_reason_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+
+            result = self.cancel(cwd, "TR-1", reason=None)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(), "取消成功：调拨单号=TR-1 退回总数=6"
+            )
+
+    def test_cancel_respects_custom_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "nested").mkdir()
+            db = str(cwd / "nested" / "ledger.db")
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1,2024-03-01,2025-03-01,10", "--db", db,
+            )
+            result = self.invoke_in(
+                cwd, "ship", "--transfer", "TR-1",
+                "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                "--line", "LOT-1,6", "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.cancel(cwd, "TR-1", db=db)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("取消成功：调拨单号=TR-1 退回总数=6", result.stdout)
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+    def test_cancel_rejections_leave_everything_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.ship(cwd, "TR-1", "LOT-1,6", "LOT-2,8").returncode, 0
+            )
+            before_a = self.query_quantities(cwd, "WH-A")
+            before_b = self.query_quantities(cwd, "WH-B")
+
+            # Unknown transfer.
+            result = self.cancel(cwd, "TR-X")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            # Blank transfer number / blank reason.
+            result = self.cancel(cwd, "   ")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("调拨单号", result.stderr)
+            self.assertEqual(result.stdout, "")
+            result = self.cancel(cwd, "TR-1", reason="   ")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("取消原因", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), before_a)
+            self.assertEqual(self.query_quantities(cwd, "WH-B"), before_b)
+            self.assertEqual(self.order_state(cwd, "TR-1")[0], "shipped")
+
+            # The order is still cancelable after the failed attempts.
+            result = self.cancel(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cancel_refused_unless_exactly_shipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(
+                self.ship(cwd, "TR-2", "LOT-2,5").returncode, 0
+            )
+
+            self.assertEqual(self.receive(cwd, "TR-1").returncode, 0)
+            self.assertEqual(
+                self.receive(cwd, "TR-2", "LOT-2,3").returncode, 0
+            )
+
+            for transfer, hint in [("TR-1", "received"), ("TR-2", "diff")]:
+                with self.subTest(transfer=transfer):
+                    result = self.cancel(cwd, transfer)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # Repeat cancellation is refused as well.
+            self.register(cwd, "WH-A", "LOT-3,2024-05-02,2025-05-02,4")
+            self.assertEqual(self.ship(cwd, "TR-3", "LOT-3,4").returncode, 0)
+            result = self.cancel(cwd, "TR-3")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.cancel(cwd, "TR-3")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("canceled", result.stderr)
+            self.assertEqual(result.stdout, "")
+            # Returned quantity must not be returned a second time.
+            self.assertEqual(self.query_quantities(cwd, "WH-A")["LOT-3"], 4)
+
+    def test_receive_after_cancel_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(self.cancel(cwd, "TR-1").returncode, 0)
+
+            result = self.receive(cwd, "TR-1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("canceled", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(self.order_state(cwd, "TR-1")[0], "canceled")
+
+    def test_cancel_atomicity_when_a_return_is_illegal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            # Ship the whole lot so the source row is deleted; the only copy
+            # of the batch dates now sits at the destination.
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,10").returncode, 0)
+
+            # Tamper with the ledger so the batch exists nowhere: no source
+            # row to append to and no current dates to carry back.
+            conn = sqlite3.connect(cwd / "stock_ledger.db")
+            try:
+                conn.execute("DELETE FROM stock_batches")
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = self.cancel(cwd, "TR-1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("无法退回", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            # Whole cancellation rejected: nothing returned, order untouched.
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {})
+            self.assertEqual(self.order_state(cwd, "TR-1")[0], "shipped")
 
 
 if __name__ == "__main__":
