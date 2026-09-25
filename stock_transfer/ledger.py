@@ -13,6 +13,7 @@ DEFAULT_DB_FILENAME = "stock_ledger.db"
 STATUS_SHIPPED = "shipped"
 STATUS_RECEIVED = "received"
 STATUS_RECEIVED_WITH_DIFF = "received-with-diff"
+STATUS_CANCELED = "canceled"
 
 
 class LedgerError(Exception):
@@ -332,3 +333,85 @@ class Ledger:
         except sqlite3.IntegrityError as exc:
             raise LedgerError(f"收货确认失败：{exc}") from exc
         return STATUS_RECEIVED_WITH_DIFF, diff_total
+
+    def cancel_transfer(self, transfer_no: str) -> int:
+        """Cancel a shipped transfer; return the total quantity sent back.
+
+        Every line's shipped quantity is returned in full to the source
+        warehouse's same lot (accumulating onto the existing row, or
+        appending a new row that reuses the destination batch's current
+        dates). The destination quantities booked at ship time are left
+        untouched. The order becomes ``canceled``, every line's received
+        quantity is recorded as 0, and any pending difference bookkeeping
+        is cleared. Any violation raises LedgerError and leaves the ledger
+        and the order untouched.
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT status, source_warehouse, dest_warehouse, product "
+                    "FROM transfers WHERE transfer_no = ?",
+                    (transfer_no,),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(f"调拨单 {transfer_no} 不存在")
+                status, source, dest, product = row
+                if status != STATUS_SHIPPED:
+                    raise LedgerError(
+                        f"调拨单 {transfer_no} 状态为 {status}，不能取消"
+                    )
+
+                lines = self._conn.execute(
+                    "SELECT lot, shipped_quantity FROM transfer_lines "
+                    "WHERE transfer_no = ? ORDER BY seq",
+                    (transfer_no,),
+                ).fetchall()
+
+                total = 0
+                for lot, shipped_qty in lines:
+                    source_row = self._conn.execute(
+                        "SELECT 1 FROM stock_batches "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (source, product, lot),
+                    ).fetchone()
+                    if source_row is not None:
+                        self._conn.execute(
+                            "UPDATE stock_batches SET quantity = quantity + ? "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (shipped_qty, source, product, lot),
+                        )
+                    else:
+                        dest_row = self._conn.execute(
+                            "SELECT production_date, expiry_date "
+                            "FROM stock_batches "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (dest, product, lot),
+                        ).fetchone()
+                        if dest_row is None:
+                            raise LedgerError(
+                                f"接收仓 {dest} 批次 {lot} 已不存在，"
+                                "无法退回发出仓"
+                            )
+                        self._conn.execute(
+                            "INSERT INTO stock_batches "
+                            "(warehouse, product, lot, production_date, "
+                            " expiry_date, quantity) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (source, product, lot, dest_row[0], dest_row[1],
+                             shipped_qty),
+                        )
+                    total += shipped_qty
+
+                self._conn.execute(
+                    "UPDATE transfer_lines SET received_quantity = 0 "
+                    "WHERE transfer_no = ?",
+                    (transfer_no,),
+                )
+                self._conn.execute(
+                    "UPDATE transfers SET status = ?, diff_total = 0 "
+                    "WHERE transfer_no = ?",
+                    (STATUS_CANCELED, transfer_no),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"调拨取消失败：{exc}") from exc
+        return total
