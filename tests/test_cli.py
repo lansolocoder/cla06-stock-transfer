@@ -252,5 +252,247 @@ class LedgerCommandTests(unittest.TestCase):
         self.assertIn("query", result.stdout)
 
 
+class TransferCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, product: str, *batches: str) -> None:
+        arguments = ["register", "--warehouse", warehouse, "--product", product]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query(self, cwd: Path, warehouse: str, product: str) -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", product
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_transfer_moves_stock_between_warehouses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(
+                cwd, "WH-A", "SKU-1001",
+                "LOT-1,2024-01-01,2025-01-01,10",
+                "LOT-2,2024-02-01,2025-02-01,5",
+            )
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--transfer-no", "TR-1",
+                "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                "--product", "SKU-1001",
+                "--line", "LOT-1,4", "--line", "LOT-2,5",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单号=TR-1", result.stdout)
+            self.assertIn("总数量=9", result.stdout)
+
+            source = self.query(cwd, "WH-A", "SKU-1001")
+            self.assertIn("批次总数=1", source)
+            self.assertIn("批次号=LOT-1", source)
+            self.assertIn("数量=6", source)
+            self.assertNotIn("LOT-2", source)
+
+            dest = self.query(cwd, "WH-B", "SKU-1001")
+            self.assertIn("批次总数=2", dest)
+            self.assertIn("批次号=LOT-1", dest)
+            self.assertIn("2024-01-01", dest)
+            self.assertIn("2025-01-01", dest)
+            self.assertIn("数量=4", dest)
+            self.assertIn("批次号=LOT-2", dest)
+            self.assertIn("数量=5", dest)
+
+    def test_transfer_merges_into_existing_destination_lot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1001", "LOT-1,2024-01-01,2025-01-01,10")
+            self.register(cwd, "WH-B", "SKU-1001", "LOT-1,2024-01-01,2025-01-01,3")
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--transfer-no", "TR-1",
+                "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                "--product", "SKU-1001", "--line", "LOT-1,4",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            dest = self.query(cwd, "WH-B", "SKU-1001")
+            self.assertIn("批次总数=1", dest)
+            self.assertIn("数量=7", dest)
+
+    def test_transfer_rejections_leave_ledger_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1001", "LOT-1,2024-01-01,2025-01-01,10")
+            ok = self.invoke_in(
+                cwd,
+                "transfer", "--transfer-no", "TR-1",
+                "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                "--product", "SKU-1001", "--line", "LOT-1,4",
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+
+            cases = [
+                # 调拨单号已存在
+                (["transfer", "--transfer-no", "TR-1",
+                  "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                  "--product", "SKU-1001", "--line", "LOT-1,1"], "已存在"),
+                # 批次不存在
+                (["transfer", "--transfer-no", "TR-2",
+                  "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                  "--product", "SKU-1001", "--line", "LOT-9,1"], "LOT-9"),
+                # 数量超过现存
+                (["transfer", "--transfer-no", "TR-2",
+                  "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                  "--product", "SKU-1001", "--line", "LOT-1,99"], "不足"),
+                # 同一单内批次号重复
+                (["transfer", "--transfer-no", "TR-2",
+                  "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                  "--product", "SKU-1001",
+                  "--line", "LOT-1,1", "--line", "LOT-1,2"], "重复"),
+                # 数量非正整数
+                (["transfer", "--transfer-no", "TR-2",
+                  "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                  "--product", "SKU-1001", "--line", "LOT-1,0"], "正整数"),
+                (["transfer", "--transfer-no", "TR-2",
+                  "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                  "--product", "SKU-1001", "--line", "LOT-1,abc"], "正整数"),
+                # 发出仓与接收仓相同
+                (["transfer", "--transfer-no", "TR-2",
+                  "--from-warehouse", "WH-A", "--to-warehouse", " WH-A ",
+                  "--product", "SKU-1001", "--line", "LOT-1,1"], "不能相同"),
+            ]
+            for arguments, hint in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.invoke_in(cwd, *arguments)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            source = self.query(cwd, "WH-A", "SKU-1001")
+            self.assertIn("批次总数=1", source)
+            self.assertIn("数量=6", source)
+            dest = self.query(cwd, "WH-B", "SKU-1001")
+            self.assertIn("批次总数=1", dest)
+            self.assertIn("数量=4", dest)
+
+    def test_receive_full_marks_transfer_received(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1001", "LOT-1,2024-01-01,2025-01-01,10")
+            self.invoke_in(
+                cwd,
+                "transfer", "--transfer-no", "TR-1",
+                "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                "--product", "SKU-1001", "--line", "LOT-1,6",
+            )
+            result = self.invoke_in(cwd, "receive", "--transfer-no", "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单号=TR-1", result.stdout)
+            self.assertIn("状态=received", result.stdout)
+
+            dest = self.query(cwd, "WH-B", "SKU-1001")
+            self.assertIn("数量=6", dest)
+
+            # 重复确认被拒绝，stderr 中可见当前状态字面值。
+            again = self.invoke_in(cwd, "receive", "--transfer-no", "TR-1")
+            self.assertEqual(again.returncode, 1)
+            self.assertIn("received", again.stderr)
+            self.assertEqual(again.stdout, "")
+
+    def test_receive_with_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(
+                cwd, "WH-A", "SKU-1001",
+                "LOT-1,2024-01-01,2025-01-01,10",
+                "LOT-2,2024-02-01,2025-02-01,5",
+            )
+            self.invoke_in(
+                cwd,
+                "transfer", "--transfer-no", "TR-1",
+                "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                "--product", "SKU-1001",
+                "--line", "LOT-1,6", "--line", "LOT-2,5",
+            )
+            # LOT-1 实收 4（差异 2），LOT-2 未给实收行（差异 5）。
+            result = self.invoke_in(
+                cwd, "receive", "--transfer-no", "TR-1", "--line", "LOT-1,4"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=received-with-diff", result.stdout)
+            self.assertIn("差异总数=7", result.stdout)
+
+            dest = self.query(cwd, "WH-B", "SKU-1001")
+            self.assertIn("批次总数=1", dest)
+            self.assertIn("批次号=LOT-1", dest)
+            self.assertIn("数量=4", dest)
+            self.assertNotIn("LOT-2", dest)
+
+            again = self.invoke_in(cwd, "receive", "--transfer-no", "TR-1")
+            self.assertEqual(again.returncode, 1)
+            self.assertIn("received-with-diff", again.stderr)
+
+    def test_receive_rejections_leave_state_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1001", "LOT-1,2024-01-01,2025-01-01,10")
+            self.invoke_in(
+                cwd,
+                "transfer", "--transfer-no", "TR-1",
+                "--from-warehouse", "WH-A", "--to-warehouse", "WH-B",
+                "--product", "SKU-1001", "--line", "LOT-1,6",
+            )
+            cases = [
+                # 调拨单不存在
+                (["receive", "--transfer-no", "TR-9"], "不存在"),
+                # 实收批次不在调拨单中
+                (["receive", "--transfer-no", "TR-1", "--line", "LOT-9,1"],
+                 "LOT-9"),
+                # 同一实收行批次号重复
+                (["receive", "--transfer-no", "TR-1",
+                  "--line", "LOT-1,1", "--line", "LOT-1,2"], "重复"),
+                # 数量非正整数
+                (["receive", "--transfer-no", "TR-1", "--line", "LOT-1,0"],
+                 "正整数"),
+                # 实收超过发运数量
+                (["receive", "--transfer-no", "TR-1", "--line", "LOT-1,7"],
+                 "超过"),
+            ]
+            for arguments, hint in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.invoke_in(cwd, *arguments)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # 台账与调拨单状态均未变：仍可正常确认。
+            result = self.invoke_in(cwd, "receive", "--transfer-no", "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=received", result.stdout)
+            dest = self.query(cwd, "WH-B", "SKU-1001")
+            self.assertIn("数量=6", dest)
+
+    def test_help_mentions_transfer_and_receive(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("transfer", result.stdout)
+        self.assertIn("receive", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
