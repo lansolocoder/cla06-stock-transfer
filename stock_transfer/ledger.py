@@ -13,6 +13,7 @@ DEFAULT_DB_FILENAME = "stock_ledger.db"
 STATUS_SHIPPED = "shipped"
 STATUS_RECEIVED = "received"
 STATUS_RECEIVED_WITH_DIFF = "received-with-diff"
+STATUS_RESOLVED = "resolved"
 STATUS_CANCELED = "canceled"
 
 
@@ -70,9 +71,16 @@ CREATE TABLE IF NOT EXISTS transfer_lines (
     lot TEXT NOT NULL,
     shipped_quantity INTEGER NOT NULL CHECK (shipped_quantity > 0),
     received_quantity INTEGER,
+    resolved_quantity INTEGER NOT NULL DEFAULT 0,
     UNIQUE (transfer_no, lot)
 );
 """
+
+# Columns added after the initial release, applied lazily to ledgers created
+# by an older version.
+_COLUMN_MIGRATIONS = {
+    "transfer_lines": [("resolved_quantity", "INTEGER NOT NULL DEFAULT 0")],
+}
 
 
 class Ledger:
@@ -86,7 +94,21 @@ class Ledger:
         conn = sqlite3.connect(str(path))
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
+        cls._migrate(conn)
         return cls(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Apply columns introduced after the initial schema, idempotently."""
+        for table, columns in _COLUMN_MIGRATIONS.items():
+            existing = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            for name, declaration in columns:
+                if name not in existing:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    )
 
     def close(self) -> None:
         self._conn.close()
@@ -432,3 +454,95 @@ class Ledger:
         except sqlite3.IntegrityError as exc:
             raise LedgerError(f"收货确认失败：{exc}") from exc
         return STATUS_RECEIVED_WITH_DIFF, diff_total
+
+    def resolve_diff(
+        self,
+        transfer_no: str,
+        settlements: Mapping[str, int] | None,
+    ) -> tuple[str, int]:
+        """Settle the pending differences of a received transfer.
+
+        Only orders whose status is ``received`` or ``received-with-diff``
+        can be processed. ``settlements`` maps lot to the quantity of that
+        lot's still-pending difference (shipped minus received minus already
+        settled) to close now; it must name only lots belonging to the order,
+        without duplicates, and each quantity must be a positive integer no
+        greater than that lot's pending difference. ``settlements=None``
+        closes every lot's full pending difference.
+
+        Closing a difference only books the disposition: warehouse stock and
+        every line's received quantity are left untouched. The closed
+        quantity accumulates per line. When every pending difference reaches
+        zero the order becomes ``resolved``; otherwise it stays
+        ``received-with-diff`` with the remainder still pending. Any
+        violation raises LedgerError and leaves the ledger and the order
+        untouched. Return (resulting status, total closed now).
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT status FROM transfers WHERE transfer_no = ?",
+                    (transfer_no,),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(f"调拨单 {transfer_no} 不存在")
+                (status,) = row
+                if status not in (STATUS_RECEIVED, STATUS_RECEIVED_WITH_DIFF):
+                    raise LedgerError(
+                        f"调拨单 {transfer_no} 状态为 {status}，不能差异处理"
+                    )
+
+                lines = self._conn.execute(
+                    "SELECT lot, shipped_quantity, received_quantity, "
+                    "resolved_quantity "
+                    "FROM transfer_lines WHERE transfer_no = ? ORDER BY seq",
+                    (transfer_no,),
+                ).fetchall()
+                pending_by_lot = {
+                    lot: shipped_qty - (received_qty or 0) - resolved_qty
+                    for lot, shipped_qty, received_qty, resolved_qty in lines
+                }
+
+                if settlements is None:
+                    chosen = dict(pending_by_lot)
+                else:
+                    chosen = dict(settlements)
+                    for lot, qty in chosen.items():
+                        if lot not in pending_by_lot:
+                            raise LedgerError(
+                                f"处理批次 {lot} 不在调拨单 {transfer_no} 中"
+                            )
+                        if qty <= 0:
+                            raise LedgerError(
+                                f"批次 {lot} 结案数量 {qty} 必须为正整数"
+                            )
+                        if qty > pending_by_lot[lot]:
+                            raise LedgerError(
+                                f"批次 {lot} 结案数量 {qty} 超过挂账差异量 "
+                                f"{pending_by_lot[lot]}"
+                            )
+
+                closed_total = sum(qty for qty in chosen.values() if qty > 0)
+                for lot, qty in chosen.items():
+                    if qty:
+                        self._conn.execute(
+                            "UPDATE transfer_lines "
+                            "SET resolved_quantity = resolved_quantity + ? "
+                            "WHERE transfer_no = ? AND lot = ?",
+                            (qty, transfer_no, lot),
+                        )
+                remaining_total = sum(pending_by_lot.values()) - closed_total
+
+                new_status = (
+                    STATUS_RESOLVED
+                    if remaining_total == 0
+                    else STATUS_RECEIVED_WITH_DIFF
+                )
+                self._conn.execute(
+                    "UPDATE transfers SET status = ?, diff_total = ? "
+                    "WHERE transfer_no = ?",
+                    (new_status, remaining_total, transfer_no),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"差异处理失败：{exc}") from exc
+        return new_status, closed_total

@@ -150,10 +150,59 @@ def _validate_transfer_lines(
     return parsed, errors
 
 
+def _validate_settle_lines(
+    raw_lines: Sequence[str],
+) -> tuple[list[tuple[int, ShipLine]], list[str]]:
+    """Validate difference-settlement lines of the form ``批次号,数量``.
+
+    Same shape as transfer lines; only shape, non-empty lot, positive-integer
+    quantity and in-command uniqueness are checked here. Whether the lot
+    belongs to the order and how much difference it still has pending is
+    checked against the ledger.
+    """
+    parsed: list[tuple[int, ShipLine]] = []
+    errors: list[str] = []
+    seen_lots: dict[str, int] = {}
+
+    for index, raw in enumerate(raw_lines, start=1):
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) != 2:
+            errors.append(
+                f"处理行 {index}: 处理行格式错误，应为“批次号,数量”"
+            )
+            continue
+
+        lot, quantity_raw = parts
+        line_ok = True
+
+        if not lot:
+            errors.append(f"处理行 {index}: 批次号不能为空")
+            line_ok = False
+
+        if not quantity_raw.isdigit() or int(quantity_raw) <= 0:
+            errors.append(f"处理行 {index}: 数量 {quantity_raw!r} 必须为正整数")
+            line_ok = False
+
+        if not line_ok:
+            continue
+
+        ship_line = ShipLine(lot, int(quantity_raw))
+        parsed.append((index, ship_line))
+        first_line = seen_lots.get(lot)
+        if first_line is None:
+            seen_lots[lot] = index
+        else:
+            errors.append(
+                f"处理行 {index}: 批次号 {lot} 与处理行 {first_line} 重复"
+            )
+
+    return parsed, errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认与调拨取消。",
+        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认、差异处理与调拨取消。",
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -167,6 +216,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "      --line LOT-2024-001,10\n"
             "  python3 -m stock_transfer receive --transfer TR-001 \\\n"
             "      --line LOT-2024-001,8\n"
+            "  python3 -m stock_transfer resolve --transfer TR-001 \\\n"
+            "      --line LOT-2024-001,2\n"
             "  python3 -m stock_transfer cancel --transfer TR-001 "
             "--reason 客户撤单"
         ),
@@ -271,6 +322,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="可选实收行，可重复提供；缺省表示按发运数量全部实收",
     )
     receive.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    resolve = subparsers.add_parser(
+        "resolve",
+        help="对状态为 received 或 received-with-diff 的调拨单做差异处理结案",
+        description=(
+            "逐行给出差异的最终处置，处理行格式：批次号,数量（正整数）。"
+            "批次号必须在该调拨单内且同一单不重复，数量不得超过该批次当前挂账"
+            "差异量（发运数量减实收数量）。不给处理行时按各批次全部挂账差异结案。"
+            "差异全部清零时状态精确变为 resolved；仍有批次挂账则保持"
+            " received-with-diff。处理只登记差异归属，不改变各仓现存数量与实收数量。"
+        ),
+    )
+    resolve.add_argument(
+        "--transfer",
+        required=True,
+        metavar="调拨单号",
+        help="待差异处理的调拨单号",
+    )
+    resolve.add_argument(
+        "--line",
+        action="append",
+        default=None,
+        metavar="批次号,数量",
+        help="处理行，可重复提供；缺省表示各批次按当前全部挂账差异结案",
+    )
+    resolve.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -432,6 +513,35 @@ def _run_receive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_resolve(args: argparse.Namespace) -> int:
+    transfer_no = args.transfer.strip()
+    if not transfer_no:
+        print("调拨单号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    settlements: dict[str, int] | None = None
+    if args.line:
+        parsed, errors = _validate_settle_lines(args.line)
+        if errors:
+            for message in errors:
+                print(message, file=sys.stderr)
+            return 1
+        settlements = {line.lot: line.quantity for _, line in parsed}
+
+    db_path = _db_path(args)
+    try:
+        with Ledger.open(db_path) as ledger:
+            _status, closed_total = ledger.resolve_diff(
+                transfer_no, settlements
+            )
+    except LedgerError as exc:
+        print(f"差异处理失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(f"差异处理成功：调拨单号={transfer_no} 结案总数={closed_total}")
+    return 0
+
+
 def _run_cancel(args: argparse.Namespace) -> int:
     transfer_no = args.transfer.strip()
     if not transfer_no:
@@ -497,6 +607,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_ship(args)
     if args.command == "receive":
         return _run_receive(args)
+    if args.command == "resolve":
+        return _run_resolve(args)
     if args.command == "cancel":
         return _run_cancel(args)
     parser.print_help()

@@ -77,6 +77,39 @@ python3 -m stock_transfer receive --transfer TR-001 \
 重复确认或对不存在的调拨单确认均拒绝。状态字面值精确为 `shipped`、`received`、
 `received-with-diff`，不做大小写或拼写变体兼容。
 
+## 差异处理
+
+对状态为 `received` 或 `received-with-diff` 的调拨单，按批次逐行给出收货核对后挂账
+差异（发运数量减实收数量）的最终处置。处理行格式为 `批次号,数量`，数量为正整数，
+`--line` 可重复提供：
+
+```bash
+python3 -m stock_transfer resolve --transfer TR-001 \
+    --line LOT-2024-001,2 --line LOT-2024-002,5
+```
+
+处理行的批次号必须出现在该调拨单的调拨行内、同一单内不得重复；每行数量必须为正整数
+且不得超过该批次当前挂账的差异量。不给任何处理行时，按各批次当前全部挂账差异结案：
+
+```bash
+python3 -m stock_transfer resolve --transfer TR-001
+```
+
+差异处理只登记差异的最终归属：发出仓与接收仓各批次现存数量、各调拨行实收数量均不因
+处理而改变。全部挂账差异清零后该单差异挂账归零，状态精确变为 `resolved`；只处理部分
+批次时，缺失批次的差异数量保持挂账不变，状态仍为 `received-with-diff`，可后续再次处理。
+成功后 stdout 精确输出一行（退出码 0），结案总数为本次结案的差异总数：
+
+```text
+差异处理成功：调拨单号=TR-001 结案总数=7
+```
+
+调拨单不存在、状态为 `shipped` 或 `canceled`、处理行批次号不在单内、批次号重复、
+数量非正整数或超过该批次挂账差异量、`--transfer` 或批次号去空白后为空，一律写 stderr、
+退出码 1、stdout 为空，台账与调拨单完全不变。状态为 `resolved` 的调拨单不能再次差异处理、
+不能收货确认、不能取消。状态字面值精确为 `received`、`received-with-diff`、`resolved`，
+不做大小写或拼写变体兼容。
+
 ## 调拨取消
 
 对状态为 `shipped` 的在途调拨单做取消，整单原子处理（任一行退回不合法则整次拒绝，
