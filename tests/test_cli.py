@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -250,6 +251,201 @@ class LedgerCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("register", result.stdout)
         self.assertIn("query", result.stdout)
+
+
+class TransferCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", "SKU-1",
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_quantities(self, cwd: Path, warehouse: str) -> dict[str, int]:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", "SKU-1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        quantities: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            match = re.match(r"批次号=(\S+) .*数量=(\d+)$", line)
+            if match:
+                quantities[match[1]] = int(match[2])
+        return quantities
+
+    def ship(self, cwd: Path, transfer: str, *lines: str,
+             source: str = "WH-A", dest: str = "WH-B") -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "ship", "--transfer", transfer,
+            "--from", source, "--to", dest, "--product", "SKU-1",
+        ]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def receive(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = ["receive", "--transfer", transfer]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def test_ship_moves_quantities_between_warehouses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,18",
+                          "LOT-2,2024-04-02,2025-04-02,12")
+            self.register(cwd, "WH-B", "LOT-1,2023-01-01,2024-01-01,5")
+
+            result = self.ship(cwd, "TR-1", "LOT-1,10", "LOT-2,12")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("TR-1", result.stdout)
+            self.assertIn("22", result.stdout)
+
+            # LOT-2 fully shipped: its source row is gone.
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {"LOT-1": 8})
+            # Existing dest lot accumulates; new lot keeps the source dates.
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-B"), {"LOT-1": 15, "LOT-2": 12}
+            )
+            result = self.invoke_in(
+                cwd, "query", "--warehouse", "WH-B", "--product", "SKU-1"
+            )
+            self.assertIn("批次号=LOT-2 生产日期=2024-04-02 有效期至=2025-04-02",
+                          result.stdout)
+
+    def test_ship_rejections_leave_ledger_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            before = self.query_quantities(cwd, "WH-A")
+
+            cases = [
+                # Unknown lot.
+                ("TR-1", ("LOT-X,1",), "不存在"),
+                # Quantity exceeds what the lot holds.
+                ("TR-2", ("LOT-1,11",), "不足"),
+                # Duplicate lot within one order.
+                ("TR-3", ("LOT-1,1", "LOT-1,2"), "重复"),
+                # Non-positive / non-numeric quantity.
+                ("TR-4", ("LOT-1,0",), "正整数"),
+                ("TR-5", ("LOT-1,abc",), "正整数"),
+                # Malformed line.
+                ("TR-6", ("LOT-1",), "格式"),
+            ]
+            for transfer, lines, hint in cases:
+                with self.subTest(transfer=transfer):
+                    result = self.ship(cwd, transfer, *lines)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # Same source and destination.
+            result = self.ship(cwd, "TR-7", "LOT-1,1", dest="WH-A")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不能相同", result.stderr)
+
+            # Blank codes.
+            result = self.ship(cwd, "  ", "LOT-1,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("调拨单号", result.stderr)
+
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), before)
+
+            # A valid order, then a duplicate transfer number.
+            result = self.ship(cwd, "TR-8", "LOT-1,4")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.ship(cwd, "TR-8", "LOT-1,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("已存在", result.stderr)
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {"LOT-1": 6})
+
+    def test_receive_full_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+
+            result = self.receive(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("received", result.stdout)
+            self.assertNotIn("received-with-diff", result.stdout)
+            self.assertEqual(self.query_quantities(cwd, "WH-B"), {"LOT-1": 6})
+
+            # Re-confirming is rejected and changes nothing.
+            result = self.receive(cwd, "TR-1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("received", result.stderr)
+            self.assertEqual(self.query_quantities(cwd, "WH-B"), {"LOT-1": 6})
+
+    def test_receive_with_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.ship(cwd, "TR-1", "LOT-1,7", "LOT-2,8").returncode, 0
+            )
+
+            result = self.receive(cwd, "TR-1", "LOT-1,5")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("received-with-diff", result.stdout)
+            # LOT-1 short by 2, LOT-2 (omitted) short by 8: total diff 10.
+            self.assertIn("10", result.stdout)
+            # Dest keeps only what was actually received per lot.
+            self.assertEqual(self.query_quantities(cwd, "WH-B"), {"LOT-1": 5})
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-A"), {"LOT-1": 3}
+            )
+
+    def test_receive_rejections_leave_order_and_ledger_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            before_a = self.query_quantities(cwd, "WH-A")
+            before_b = self.query_quantities(cwd, "WH-B")
+
+            # Unknown transfer.
+            result = self.receive(cwd, "TR-X")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+
+            cases = [
+                # Lot not part of the order.
+                (("LOT-2,1",), "不在调拨单"),
+                # Received more than shipped.
+                (("LOT-1,7",), "超过"),
+                # Duplicate received lot.
+                (("LOT-1,1", "LOT-1,2"), "重复"),
+                # Non-positive quantity.
+                (("LOT-1,0",), "正整数"),
+            ]
+            for lines, hint in cases:
+                with self.subTest(lines=lines):
+                    result = self.receive(cwd, "TR-1", *lines)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), before_a)
+            self.assertEqual(self.query_quantities(cwd, "WH-B"), before_b)
+
+            # The order is still confirmable after the failed attempts.
+            result = self.receive(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("received", result.stdout)
 
 
 if __name__ == "__main__":

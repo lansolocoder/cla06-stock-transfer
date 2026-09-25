@@ -1,13 +1,22 @@
-"""SQLite-backed local ledger for stock batches (stdlib only)."""
+"""SQLite-backed local ledger for stock batches and transfers (stdlib only)."""
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_DB_FILENAME = "stock_ledger.db"
+
+# Transfer order status literals; matched exactly, no case/spelling variants.
+STATUS_SHIPPED = "shipped"
+STATUS_RECEIVED = "received"
+STATUS_RECEIVED_WITH_DIFF = "received-with-diff"
+
+
+class LedgerError(Exception):
+    """A business-rule violation detected while writing to the ledger."""
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,14 @@ class BatchRecord(BatchInput):
     """One persisted batch row."""
 
 
+@dataclass(frozen=True)
+class ShipLine:
+    """One transfer line: which lot to move and how much."""
+
+    lot: str
+    quantity: int
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_batches (
     id INTEGER PRIMARY KEY,
@@ -35,6 +52,24 @@ CREATE TABLE IF NOT EXISTS stock_batches (
     expiry_date TEXT NOT NULL,
     quantity INTEGER NOT NULL CHECK (quantity > 0),
     UNIQUE (warehouse, product, lot)
+);
+CREATE TABLE IF NOT EXISTS transfers (
+    transfer_no TEXT PRIMARY KEY,
+    source_warehouse TEXT NOT NULL,
+    dest_warehouse TEXT NOT NULL,
+    product TEXT NOT NULL,
+    status TEXT NOT NULL,
+    total_quantity INTEGER NOT NULL,
+    diff_total INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS transfer_lines (
+    id INTEGER PRIMARY KEY,
+    transfer_no TEXT NOT NULL REFERENCES transfers (transfer_no),
+    seq INTEGER NOT NULL,
+    lot TEXT NOT NULL,
+    shipped_quantity INTEGER NOT NULL CHECK (shipped_quantity > 0),
+    received_quantity INTEGER,
+    UNIQUE (transfer_no, lot)
 );
 """
 
@@ -48,7 +83,8 @@ class Ledger:
     @classmethod
     def open(cls, path: str | Path) -> "Ledger":
         conn = sqlite3.connect(str(path))
-        conn.execute(_SCHEMA)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(_SCHEMA)
         return cls(conn)
 
     def close(self) -> None:
@@ -98,3 +134,201 @@ class Ledger:
             (warehouse, product),
         )
         return [BatchRecord(*row) for row in rows]
+
+    def ship_transfer(
+        self,
+        transfer_no: str,
+        source: str,
+        dest: str,
+        product: str,
+        lines: Sequence[ShipLine],
+    ) -> int:
+        """Book a whole transfer order atomically; return total shipped quantity.
+
+        The source lots are decremented and the destination lots incremented
+        (reusing the source batch dates) in one transaction. Any rule
+        violation raises LedgerError and leaves the ledger untouched.
+        """
+        if not lines:
+            raise LedgerError("调拨单至少需要一行调拨行")
+        seen_lots: set[str] = set()
+        for line in lines:
+            if line.lot in seen_lots:
+                raise LedgerError(f"批次号 {line.lot} 在同一调拨单内重复")
+            seen_lots.add(line.lot)
+
+        try:
+            with self._conn:
+                existing = self._conn.execute(
+                    "SELECT 1 FROM transfers WHERE transfer_no = ?",
+                    (transfer_no,),
+                ).fetchone()
+                if existing is not None:
+                    raise LedgerError(f"调拨单号 {transfer_no} 已存在")
+
+                for line in lines:
+                    row = self._conn.execute(
+                        "SELECT production_date, expiry_date, quantity "
+                        "FROM stock_batches "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (source, product, line.lot),
+                    ).fetchone()
+                    if row is None:
+                        raise LedgerError(
+                            f"批次 {line.lot} 在仓库 {source} 商品 {product} 下不存在"
+                        )
+                    production_date, expiry_date, on_hand = row
+                    if line.quantity > on_hand:
+                        raise LedgerError(
+                            f"批次 {line.lot} 现存数量 {on_hand} "
+                            f"不足调拨数量 {line.quantity}"
+                        )
+                    remaining = on_hand - line.quantity
+                    if remaining == 0:
+                        self._conn.execute(
+                            "DELETE FROM stock_batches "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (source, product, line.lot),
+                        )
+                    else:
+                        self._conn.execute(
+                            "UPDATE stock_batches SET quantity = ? "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (remaining, source, product, line.lot),
+                        )
+                    self._conn.execute(
+                        "INSERT INTO stock_batches "
+                        "(warehouse, product, lot, production_date, expiry_date, "
+                        " quantity) VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT (warehouse, product, lot) "
+                        "DO UPDATE SET quantity = quantity + excluded.quantity",
+                        (
+                            dest,
+                            product,
+                            line.lot,
+                            production_date,
+                            expiry_date,
+                            line.quantity,
+                        ),
+                    )
+
+                total = sum(line.quantity for line in lines)
+                self._conn.execute(
+                    "INSERT INTO transfers "
+                    "(transfer_no, source_warehouse, dest_warehouse, product, "
+                    " status, total_quantity, diff_total) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                    (transfer_no, source, dest, product, STATUS_SHIPPED, total),
+                )
+                self._conn.executemany(
+                    "INSERT INTO transfer_lines "
+                    "(transfer_no, seq, lot, shipped_quantity) VALUES (?, ?, ?, ?)",
+                    [
+                        (transfer_no, seq, line.lot, line.quantity)
+                        for seq, line in enumerate(lines, start=1)
+                    ],
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"调拨提交失败：{exc}") from exc
+        return total
+
+    def confirm_receipt(
+        self, transfer_no: str, received: Mapping[str, int] | None
+    ) -> tuple[int, int]:
+        """Confirm receipt of a shipped transfer; return (status, diff_total).
+
+        ``received=None`` accepts every line at its shipped quantity
+        (status ``received``). Otherwise each lot's received quantity is
+        checked against the order and the destination stock is adjusted by
+        the difference (status ``received-with-diff``). Any violation raises
+        LedgerError and leaves the ledger and the order untouched.
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT status, dest_warehouse, product "
+                    "FROM transfers WHERE transfer_no = ?",
+                    (transfer_no,),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(f"调拨单 {transfer_no} 不存在")
+                status, dest, product = row
+                if status != STATUS_SHIPPED:
+                    raise LedgerError(
+                        f"调拨单 {transfer_no} 状态为 {status}，不能确认收货"
+                    )
+
+                lines = self._conn.execute(
+                    "SELECT lot, shipped_quantity FROM transfer_lines "
+                    "WHERE transfer_no = ? ORDER BY seq",
+                    (transfer_no,),
+                ).fetchall()
+
+                if received is None:
+                    self._conn.execute(
+                        "UPDATE transfer_lines "
+                        "SET received_quantity = shipped_quantity "
+                        "WHERE transfer_no = ?",
+                        (transfer_no,),
+                    )
+                    self._conn.execute(
+                        "UPDATE transfers SET status = ? WHERE transfer_no = ?",
+                        (STATUS_RECEIVED, transfer_no),
+                    )
+                    return STATUS_RECEIVED, 0
+
+                shipped_by_lot = {lot: qty for lot, qty in lines}
+                for lot, qty in received.items():
+                    if lot not in shipped_by_lot:
+                        raise LedgerError(
+                            f"实收批次 {lot} 不在调拨单 {transfer_no} 中"
+                        )
+                    if qty > shipped_by_lot[lot]:
+                        raise LedgerError(
+                            f"批次 {lot} 实收数量 {qty} 超过发运数量 "
+                            f"{shipped_by_lot[lot]}"
+                        )
+
+                diff_total = 0
+                for lot, shipped_qty in lines:
+                    received_qty = received.get(lot, 0)
+                    diff = shipped_qty - received_qty
+                    diff_total += diff
+                    if diff:
+                        # Ship-time booked the full shipped quantity at the
+                        # destination; pull the unreceived difference back out.
+                        row = self._conn.execute(
+                            "SELECT quantity FROM stock_batches "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (dest, product, lot),
+                        ).fetchone()
+                        if row is None or row[0] < diff:
+                            raise LedgerError(
+                                f"接收仓 {dest} 批次 {lot} 现存数量不足，"
+                                "无法回冲差异"
+                            )
+                        if row[0] == diff:
+                            self._conn.execute(
+                                "DELETE FROM stock_batches "
+                                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                                (dest, product, lot),
+                            )
+                        else:
+                            self._conn.execute(
+                                "UPDATE stock_batches SET quantity = quantity - ? "
+                                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                                (diff, dest, product, lot),
+                            )
+                    self._conn.execute(
+                        "UPDATE transfer_lines SET received_quantity = ? "
+                        "WHERE transfer_no = ? AND lot = ?",
+                        (received_qty, transfer_no, lot),
+                    )
+                self._conn.execute(
+                    "UPDATE transfers SET status = ?, diff_total = ? "
+                    "WHERE transfer_no = ?",
+                    (STATUS_RECEIVED_WITH_DIFF, diff_total, transfer_no),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"收货确认失败：{exc}") from exc
+        return STATUS_RECEIVED_WITH_DIFF, diff_total
