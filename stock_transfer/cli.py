@@ -13,7 +13,9 @@ from pathlib import Path
 from . import __version__
 from .ledger import (
     DEFAULT_DB_FILENAME,
+    STATUS_CANCELED,
     STATUS_RECEIVED,
+    STATUS_SHIPPED,
     BatchInput,
     Ledger,
     LedgerError,
@@ -171,7 +173,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 -m stock_transfer cancel --transfer TR-001 "
             "--reason 客户撤单\n"
             "  python3 -m stock_transfer resolve --transfer TR-001 "
-            "--line LOT-2024-001,2"
+            "--line LOT-2024-001,2\n"
+            "  python3 -m stock_transfer detail --transfer TR-001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -329,6 +332,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="差异处理行，可重复提供；缺省表示各批次当前全部挂账差异结案",
     )
     resolve.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    detail = subparsers.add_parser(
+        "detail",
+        help="逐行查询某调拨单的发运、实收、挂账差异与结案情况",
+        description=(
+            "只读查询，不修改任何台账数据。按调拨行原始顺序逐行输出"
+            "状态、批次号、发运数量、实收数量、挂账差异与已结案数量；"
+            "未确认收货的调拨行实收数量显示为“未收货”。"
+        ),
+    )
+    detail.add_argument(
+        "--transfer", required=True, metavar="调拨单号", help="待查询的调拨单号"
+    )
+    detail.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -545,6 +566,45 @@ def _run_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_detail(args: argparse.Namespace) -> int:
+    transfer_no = args.transfer.strip()
+    if not transfer_no:
+        print("调拨单号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    if not db_path.exists():
+        print(f"调拨单 {transfer_no} 不存在", file=sys.stderr)
+        return 1
+
+    with Ledger.open(db_path) as ledger:
+        detail = ledger.get_transfer_detail(transfer_no)
+    if detail is None:
+        print(f"调拨单 {transfer_no} 不存在", file=sys.stderr)
+        return 1
+
+    status, lines = detail
+    for line in lines:
+        # shipped 与 canceled 的调拨行从未确认收货（取消时实收数量记 0
+        # 只是账面回退，并不构成收货）：显示“未收货”，差异与结案均为 0。
+        if status in (STATUS_SHIPPED, STATUS_CANCELED):
+            received_text = "未收货"
+            pending_diff = 0
+            resolved = 0
+        else:
+            received_text = str(line.received_quantity)
+            resolved = line.resolved_quantity
+            pending_diff = (
+                line.shipped_quantity - line.received_quantity - resolved
+            )
+        print(
+            f"调拨单号={transfer_no} 状态={status} 批次号={line.lot} "
+            f"发运数量={line.shipped_quantity} 实收数量={received_text} "
+            f"挂账差异={pending_diff} 已结案={resolved}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     if argv is None:
@@ -566,5 +626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_cancel(args)
     if args.command == "resolve":
         return _run_resolve(args)
+    if args.command == "detail":
+        return _run_detail(args)
     parser.print_help()
     return 0

@@ -1012,5 +1012,281 @@ class ResolveCommandTests(unittest.TestCase):
             self.assertEqual(self.order_state(cwd, "TR-2")[0], "resolved")
 
 
+class DetailCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", "SKU-1",
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def ship(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "ship", "--transfer", transfer,
+            "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+        ]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def receive(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = ["receive", "--transfer", transfer]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def resolve(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = ["resolve", "--transfer", transfer]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def detail(self, cwd: Path, transfer: str,
+               db: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = ["detail", "--transfer", transfer]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def detail_rows(self, stdout: str, transfer: str) -> list[dict[str, str]]:
+        pattern = re.compile(
+            r"^调拨单号=(\S+) 状态=(shipped|received|received-with-diff|"
+            r"resolved|canceled) 批次号=(\S+) 发运数量=(\d+) "
+            r"实收数量=(\d+|未收货) 挂账差异=(\d+) 已结案=(\d+)$"
+        )
+        rows: list[dict[str, str]] = []
+        for line in stdout.splitlines():
+            match = pattern.match(line)
+            self.assertIsNotNone(match, f"unexpected output line: {line!r}")
+            self.assertEqual(match[1], transfer)
+            rows.append({
+                "状态": match[2],
+                "批次号": match[3],
+                "发运数量": match[4],
+                "实收数量": match[5],
+                "挂账差异": match[6],
+                "已结案": match[7],
+            })
+        return rows
+
+    def test_detail_of_shipped_order_shows_unreceived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.ship(cwd, "TR-1", "LOT-1,7", "LOT-2,8").returncode, 0
+            )
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            rows = self.detail_rows(result.stdout, "TR-1")
+            self.assertEqual([row["批次号"] for row in rows], ["LOT-1", "LOT-2"])
+            for row in rows:
+                self.assertEqual(row["状态"], "shipped")
+                self.assertEqual(row["实收数量"], "未收货")
+                self.assertEqual(row["挂账差异"], "0")
+                self.assertEqual(row["已结案"], "0")
+            self.assertEqual([row["发运数量"] for row in rows], ["7", "8"])
+
+    def test_detail_of_fully_received_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(self.receive(cwd, "TR-1").returncode, 0)
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = self.detail_rows(result.stdout, "TR-1")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["状态"], "received")
+            self.assertEqual(rows[0]["发运数量"], "6")
+            self.assertEqual(rows[0]["实收数量"], "6")
+            self.assertEqual(rows[0]["挂账差异"], "0")
+            self.assertEqual(rows[0]["已结案"], "0")
+
+    def test_detail_tracks_pending_difference_and_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.ship(cwd, "TR-1", "LOT-1,7", "LOT-2,8").returncode, 0
+            )
+            self.assertEqual(
+                self.receive(cwd, "TR-1", "LOT-1,5", "LOT-2,5").returncode, 0
+            )
+            self.assertEqual(self.resolve(cwd, "TR-1", "LOT-1,2").returncode, 0)
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = {row["批次号"]: row for row
+                    in self.detail_rows(result.stdout, "TR-1")}
+            self.assertEqual(rows["LOT-1"]["状态"], "received-with-diff")
+            self.assertEqual(rows["LOT-1"]["发运数量"], "7")
+            self.assertEqual(rows["LOT-1"]["实收数量"], "5")
+            self.assertEqual(rows["LOT-1"]["挂账差异"], "0")
+            self.assertEqual(rows["LOT-1"]["已结案"], "2")
+            self.assertEqual(rows["LOT-2"]["状态"], "received-with-diff")
+            self.assertEqual(rows["LOT-2"]["发运数量"], "8")
+            self.assertEqual(rows["LOT-2"]["实收数量"], "5")
+            self.assertEqual(rows["LOT-2"]["挂账差异"], "3")
+            self.assertEqual(rows["LOT-2"]["已结案"], "0")
+
+            self.assertEqual(self.resolve(cwd, "TR-1").returncode, 0)
+            result = self.detail(cwd, "TR-1")
+            rows = {row["批次号"]: row for row
+                    in self.detail_rows(result.stdout, "TR-1")}
+            self.assertEqual(rows["LOT-1"]["状态"], "resolved")
+            self.assertEqual(rows["LOT-1"]["挂账差异"], "0")
+            self.assertEqual(rows["LOT-1"]["已结案"], "2")
+            self.assertEqual(rows["LOT-2"]["状态"], "resolved")
+            self.assertEqual(rows["LOT-2"]["挂账差异"], "0")
+            self.assertEqual(rows["LOT-2"]["已结案"], "3")
+
+    def test_detail_of_canceled_order_shows_unreceived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "cancel", "--transfer", "TR-1", "--reason", "撤单"
+                ).returncode,
+                0,
+            )
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = self.detail_rows(result.stdout, "TR-1")
+            self.assertEqual(rows[0]["状态"], "canceled")
+            self.assertEqual(rows[0]["实收数量"], "未收货")
+            self.assertEqual(rows[0]["挂账差异"], "0")
+            self.assertEqual(rows[0]["已结案"], "0")
+
+    def test_detail_respects_custom_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "nested").mkdir()
+            db = str(cwd / "nested" / "ledger.db")
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1,2024-03-01,2025-03-01,10", "--db", db,
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "ship", "--transfer", "TR-1",
+                    "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                    "--line", "LOT-1,6", "--db", db,
+                ).returncode,
+                0,
+            )
+
+            result = self.detail(cwd, "TR-1", db=db)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = self.detail_rows(result.stdout, "TR-1")
+            self.assertEqual(rows[0]["批次号"], "LOT-1")
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+    def test_detail_failures_write_stderr_and_create_no_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+
+            # No ledger in this directory: unknown transfer, no file created.
+            result = self.detail(cwd, "TR-X")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+            # Blank transfer number likewise creates nothing.
+            result = self.detail(cwd, "   ")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("调拨单号", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+            # Existing ledger, but the transfer number is not in it.
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            result = self.detail(cwd, "TR-X")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_detail_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.ship(cwd, "TR-1", "LOT-1,7", "LOT-2,8").returncode, 0
+            )
+            self.assertEqual(
+                self.receive(cwd, "TR-1", "LOT-1,5").returncode, 0
+            )
+
+            conn = sqlite3.connect(cwd / "stock_ledger.db")
+            try:
+                before = conn.execute(
+                    "SELECT transfer_no, status, total_quantity, diff_total "
+                    "FROM transfers"
+                ).fetchall()
+                before_lines = conn.execute(
+                    "SELECT transfer_no, seq, lot, shipped_quantity, "
+                    "received_quantity, resolved_quantity "
+                    "FROM transfer_lines ORDER BY transfer_no, seq"
+                ).fetchall()
+                before_stock = conn.execute(
+                    "SELECT warehouse, product, lot, quantity "
+                    "FROM stock_batches ORDER BY id"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            conn = sqlite3.connect(cwd / "stock_ledger.db")
+            try:
+                self.assertEqual(
+                    before,
+                    conn.execute(
+                        "SELECT transfer_no, status, total_quantity, diff_total "
+                        "FROM transfers"
+                    ).fetchall(),
+                )
+                self.assertEqual(
+                    before_lines,
+                    conn.execute(
+                        "SELECT transfer_no, seq, lot, shipped_quantity, "
+                        "received_quantity, resolved_quantity "
+                        "FROM transfer_lines ORDER BY transfer_no, seq"
+                    ).fetchall(),
+                )
+                self.assertEqual(
+                    before_stock,
+                    conn.execute(
+                        "SELECT warehouse, product, lot, quantity "
+                        "FROM stock_batches ORDER BY id"
+                    ).fetchall(),
+                )
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
