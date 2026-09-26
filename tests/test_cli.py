@@ -738,5 +738,348 @@ class CancelCommandTests(unittest.TestCase):
             self.assertEqual(self.order_state(cwd, "TR-1")[0], "shipped")
 
 
+class DiffAndResolveCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", "SKU-1",
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def ship(self, cwd: Path, transfer: str, *lines: str,
+             source: str = "WH-A", dest: str = "WH-B") -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "ship", "--transfer", transfer,
+            "--from", source, "--to", dest, "--product", "SKU-1",
+        ]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def receive(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = ["receive", "--transfer", transfer]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def resolve(self, cwd: Path, transfer: str, *lines: str) -> subprocess.CompletedProcess[str]:
+        arguments = ["resolve", "--transfer", transfer]
+        for line in lines:
+            arguments += ["--line", line]
+        return self.invoke_in(cwd, *arguments)
+
+    def diff(self, cwd: Path, transfer: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke_in(cwd, "diff", "--transfer", transfer)
+
+    def order_state(self, cwd: Path, transfer: str) -> tuple[str, int]:
+        conn = sqlite3.connect(cwd / "stock_ledger.db")
+        try:
+            row = conn.execute(
+                "SELECT status, diff_total FROM transfers WHERE transfer_no = ?",
+                (transfer,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            conn.close()
+        return row[0], row[1]
+
+    def setup_diff_order(self, cwd: Path) -> None:
+        self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                      "LOT-2,2024-04-02,2025-04-02,8")
+        self.assertEqual(
+            self.ship(cwd, "TR-1", "LOT-1,7", "LOT-2,8").returncode, 0
+        )
+        # LOT-1 short 2, LOT-2 omitted so short 8.
+        self.assertEqual(self.receive(cwd, "TR-1", "LOT-1,5").returncode, 0)
+
+    def test_diff_lists_outstanding_batches_in_line_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.setup_diff_order(cwd)
+
+            result = self.diff(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            self.assertEqual(
+                lines[0],
+                "调拨单号=TR-1 状态=received-with-diff 未结差异总数=10",
+            )
+            self.assertEqual(
+                lines[1],
+                "批次号=LOT-1 发运数量=7 实收数量=5 未结差异数量=2 "
+                "已结清数量=0 原因=未说明",
+            )
+            self.assertEqual(
+                lines[2],
+                "批次号=LOT-2 发运数量=8 实收数量=0 未结差异数量=8 "
+                "已结清数量=0 原因=未说明",
+            )
+            self.assertEqual(result.stderr, "")
+
+    def test_diff_without_difference_outputs_only_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(self.receive(cwd, "TR-1").returncode, 0)
+
+            result = self.diff(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["调拨单号=TR-1 状态=received 未结差异总数=0"],
+            )
+
+    def test_diff_unknown_transfer_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = self.diff(cwd, "NOPE")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_resolve_all_marks_order_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.setup_diff_order(cwd)
+
+            result = self.resolve(cwd, "TR-1", "LOT-1,2,运输破损", "LOT-2,8")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "差异结清成功：调拨单号=TR-1 结清数量=10 状态=resolved",
+            )
+
+            result = self.diff(cwd, "TR-1")
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["调拨单号=TR-1 状态=resolved 未结差异总数=0"],
+            )
+            self.assertEqual(self.order_state(cwd, "TR-1"), ("resolved", 0))
+
+            # A fully resolved order cannot be resolved again.
+            result = self.resolve(cwd, "TR-1", "LOT-1,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("resolved", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_partial_resolve_keeps_order_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.setup_diff_order(cwd)
+
+            result = self.resolve(cwd, "TR-1", "LOT-1,1,运输破损")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "差异结清成功：调拨单号=TR-1 结清数量=1 状态=received-with-diff",
+            )
+            self.assertEqual(self.order_state(cwd, "TR-1"),
+                             ("received-with-diff", 9))
+
+            result = self.diff(cwd, "TR-1")
+            lines = result.stdout.splitlines()
+            self.assertEqual(
+                lines[0],
+                "调拨单号=TR-1 状态=received-with-diff 未结差异总数=9",
+            )
+            self.assertIn("批次号=LOT-1 发运数量=7 实收数量=5 未结差异数量=1 "
+                          "已结清数量=1 原因=运输破损", lines)
+            self.assertIn("LOT-2", result.stdout)
+
+    def test_repeated_resolution_accumulates_and_reason_takes_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,20")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,10").returncode, 0)
+            # Outstanding difference of 5.
+            self.assertEqual(self.receive(cwd, "TR-1", "LOT-1,5").returncode, 0)
+
+            self.assertEqual(
+                self.resolve(cwd, "TR-1", "LOT-1,1,原因甲").returncode, 0
+            )
+            result = self.resolve(cwd, "TR-1", "LOT-1,1,  ")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.diff(cwd, "TR-1")
+            # Blank/whitespace reason normalizes to 未说明 and overrides the
+            # previous reason; resolved quantity accumulates while the lot is
+            # still outstanding so its batch line stays visible.
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "调拨单号=TR-1 状态=received-with-diff 未结差异总数=3",
+                    "批次号=LOT-1 发运数量=10 实收数量=5 未结差异数量=3 "
+                    "已结清数量=2 原因=未说明",
+                ],
+            )
+
+    def test_resolve_rejections_leave_ledger_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.setup_diff_order(cwd)
+            self.assertEqual(self.order_state(cwd, "TR-1"),
+                             ("received-with-diff", 10))
+
+            # Unknown transfer.
+            result = self.resolve(cwd, "NOPE", "LOT-1,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            # Blank transfer number.
+            result = self.invoke_in(cwd, "resolve", "--transfer", "  ",
+                                    "--line", "LOT-1,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("调拨单号", result.stderr)
+
+            cases = [
+                # Lot not among the order's difference lots.
+                (("LOT-X,1",), "差异批次内"),
+                # Quantity above the outstanding difference.
+                (("LOT-1,3",), "超过未结差异数量"),
+                # Duplicate lot within one command.
+                (("LOT-1,1,a", "LOT-1,1,b"), "重复"),
+                # More than three fields.
+                (("LOT-1,1,a,b",), "格式错误"),
+                # Non-positive / non-numeric quantity.
+                (("LOT-1,0",), "正整数"),
+                (("LOT-1,abc",), "正整数"),
+                # Blank lot.
+                ((",1",), "批次号不能为空"),
+            ]
+            for resolve_lines, hint in cases:
+                with self.subTest(resolve_lines=resolve_lines):
+                    result = self.resolve(cwd, "TR-1", *resolve_lines)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(self.order_state(cwd, "TR-1"),
+                                     ("received-with-diff", 10))
+
+            # The whole order is still resolvable after the failed attempts.
+            result = self.resolve(cwd, "TR-1", "LOT-1,2", "LOT-2,8")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_resolve_requires_exact_received_with_diff_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(self.ship(cwd, "TR-1", "LOT-1,6").returncode, 0)
+            self.assertEqual(self.ship(cwd, "TR-2", "LOT-2,5").returncode, 0)
+            self.assertEqual(self.receive(cwd, "TR-1").returncode, 0)
+            # Only shipped orders can be canceled.
+            self.assertEqual(
+                self.invoke_in(cwd, "cancel", "--transfer", "TR-2",
+                               "--reason", "x").returncode,
+                0,
+            )
+
+            for transfer, hint in [
+                ("TR-1", "received"),
+                # TR-2 was received-with-diff then canceled.
+                ("TR-2", "canceled"),
+            ]:
+                with self.subTest(transfer=transfer):
+                    result = self.resolve(cwd, transfer, "LOT-1,1")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # A shipped order cannot be resolved either.
+            self.register(cwd, "WH-C", "LOT-3,2024-05-02,2025-05-02,4")
+            self.assertEqual(self.ship(cwd, "TR-3", "LOT-3,4",
+                                      source="WH-C").returncode, 0)
+            result = self.resolve(cwd, "TR-3", "LOT-3,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("shipped", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_diff_on_canceled_order_reports_zeroes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-C", "LOT-9,2024-01-01,2025-01-01,5")
+            self.assertEqual(
+                self.ship(cwd, "TR-9", "LOT-9,5", source="WH-C").returncode, 0
+            )
+            self.assertEqual(
+                self.invoke_in(cwd, "cancel", "--transfer", "TR-9",
+                               "--reason", "x").returncode,
+                0,
+            )
+
+            result = self.diff(cwd, "TR-9")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["调拨单号=TR-9 状态=canceled 未结差异总数=0"],
+            )
+
+    def test_diff_and_resolve_respect_custom_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "nested").mkdir()
+            db = str(cwd / "nested" / "ledger.db")
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1,2024-03-01,2025-03-01,10", "--db", db,
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "ship", "--transfer", "TR-1",
+                    "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                    "--line", "LOT-1,6", "--db", db,
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "receive", "--transfer", "TR-1",
+                    "--line", "LOT-1,4", "--db", db,
+                ).returncode,
+                0,
+            )
+
+            result = self.invoke_in(
+                cwd, "diff", "--transfer", "TR-1", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("未结差异总数=2", result.stdout)
+
+            result = self.invoke_in(
+                cwd, "resolve", "--transfer", "TR-1",
+                "--line", "LOT-1,2", "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=resolved", result.stdout)
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+    def test_help_mentions_resolve_and_diff(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("resolve", result.stdout)
+        self.assertIn("diff", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
