@@ -14,6 +14,7 @@ STATUS_SHIPPED = "shipped"
 STATUS_RECEIVED = "received"
 STATUS_RECEIVED_WITH_DIFF = "received-with-diff"
 STATUS_CANCELED = "canceled"
+STATUS_RESOLVED = "resolved"
 
 
 class LedgerError(Exception):
@@ -43,6 +44,27 @@ class ShipLine:
     quantity: int
 
 
+@dataclass(frozen=True)
+class ResolveLine:
+    """One difference-resolution line: which lot to clear, how much, and why."""
+
+    lot: str
+    quantity: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class DiffLine:
+    """One transfer line's difference breakdown for the diff query."""
+
+    lot: str
+    shipped_quantity: int
+    received_quantity: int
+    pending_quantity: int
+    resolved_quantity: int
+    reason: str
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_batches (
     id INTEGER PRIMARY KEY,
@@ -70,9 +92,17 @@ CREATE TABLE IF NOT EXISTS transfer_lines (
     lot TEXT NOT NULL,
     shipped_quantity INTEGER NOT NULL CHECK (shipped_quantity > 0),
     received_quantity INTEGER,
+    resolved_quantity INTEGER NOT NULL DEFAULT 0,
+    resolved_reason TEXT,
     UNIQUE (transfer_no, lot)
 );
 """
+
+# Columns added after the initial schema; backfilled into existing databases.
+_TRANSFER_LINE_MIGRATIONS = (
+    ("resolved_quantity", "resolved_quantity INTEGER NOT NULL DEFAULT 0"),
+    ("resolved_reason", "resolved_reason TEXT"),
+)
 
 
 class Ledger:
@@ -86,6 +116,15 @@ class Ledger:
         conn = sqlite3.connect(str(path))
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(transfer_lines)")
+        }
+        for name, definition in _TRANSFER_LINE_MIGRATIONS:
+            if name not in columns:
+                conn.execute(
+                    f"ALTER TABLE transfer_lines ADD COLUMN {definition}"
+                )
+        conn.commit()
         return cls(conn)
 
     def close(self) -> None:
@@ -432,3 +471,129 @@ class Ledger:
         except sqlite3.IntegrityError as exc:
             raise LedgerError(f"收货确认失败：{exc}") from exc
         return STATUS_RECEIVED_WITH_DIFF, diff_total
+
+    def resolve_diff(
+        self, transfer_no: str, resolutions: Sequence[ResolveLine]
+    ) -> tuple[int, str]:
+        """Clear pending differences of a received-with-diff transfer.
+
+        Return ``(resolved_total, new_status)``. Every resolution line is
+        checked against the order first: the lot must be one of the order's
+        difference batches, must not repeat within one command, and the
+        quantity must be a positive integer no larger than that lot's
+        pending difference (shipped minus received minus already resolved).
+        Any violation raises LedgerError and leaves the ledger and the order
+        untouched. When every difference is cleared the order becomes
+        ``resolved``; otherwise it stays ``received-with-diff`` with the
+        remaining difference still on the books.
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT status FROM transfers WHERE transfer_no = ?",
+                    (transfer_no,),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(f"调拨单 {transfer_no} 不存在")
+                status = row[0]
+                if status != STATUS_RECEIVED_WITH_DIFF:
+                    raise LedgerError(
+                        f"调拨单 {transfer_no} 状态为 {status}，不能结清差异"
+                    )
+
+                lines = self._conn.execute(
+                    "SELECT lot, shipped_quantity, received_quantity, "
+                    "resolved_quantity FROM transfer_lines "
+                    "WHERE transfer_no = ? ORDER BY seq",
+                    (transfer_no,),
+                ).fetchall()
+                pending_by_lot = {
+                    lot: shipped - received - resolved
+                    for lot, shipped, received, resolved in lines
+                }
+
+                seen_lots: set[str] = set()
+                for line in resolutions:
+                    if line.lot in seen_lots:
+                        raise LedgerError(
+                            f"批次 {line.lot} 在同一结清命令内重复"
+                        )
+                    seen_lots.add(line.lot)
+                    pending = pending_by_lot.get(line.lot)
+                    if pending is None or pending <= 0:
+                        raise LedgerError(
+                            f"批次 {line.lot} 不在调拨单 {transfer_no} 的"
+                            "差异批次中"
+                        )
+                    if line.quantity > pending:
+                        raise LedgerError(
+                            f"批次 {line.lot} 结清数量 {line.quantity} "
+                            f"超过未结差异数量 {pending}"
+                        )
+
+                total = 0
+                for line in resolutions:
+                    self._conn.execute(
+                        "UPDATE transfer_lines "
+                        "SET resolved_quantity = resolved_quantity + ?, "
+                        "    resolved_reason = ? "
+                        "WHERE transfer_no = ? AND lot = ?",
+                        (line.quantity, line.reason, transfer_no, line.lot),
+                    )
+                    total += line.quantity
+
+                remaining = sum(pending_by_lot.values()) - total
+                new_status = (
+                    STATUS_RESOLVED if remaining == 0 else STATUS_RECEIVED_WITH_DIFF
+                )
+                self._conn.execute(
+                    "UPDATE transfers SET status = ?, diff_total = ? "
+                    "WHERE transfer_no = ?",
+                    (new_status, remaining, transfer_no),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"差异结清失败：{exc}") from exc
+        return total, new_status
+
+    def diff_report(self, transfer_no: str) -> tuple[str, list[DiffLine]]:
+        """Return (status, per-lot difference lines) for any transfer order.
+
+        Lines come back in the order's original line order. A ``canceled``
+        order (and a ``shipped`` one, where no receipt was ever booked)
+        carries no pending or resolved difference: both are reported as 0
+        with the reason 未说明.
+        """
+        row = self._conn.execute(
+            "SELECT status FROM transfers WHERE transfer_no = ?",
+            (transfer_no,),
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"调拨单 {transfer_no} 不存在")
+        status = row[0]
+
+        rows = self._conn.execute(
+            "SELECT lot, shipped_quantity, received_quantity, "
+            "resolved_quantity, resolved_reason FROM transfer_lines "
+            "WHERE transfer_no = ? ORDER BY seq",
+            (transfer_no,),
+        ).fetchall()
+
+        lines: list[DiffLine] = []
+        for lot, shipped, received, resolved, reason in rows:
+            if status == STATUS_CANCELED or received is None:
+                pending = 0
+                resolved = 0
+                reason = None
+            else:
+                pending = shipped - received - resolved
+            lines.append(
+                DiffLine(
+                    lot=lot,
+                    shipped_quantity=shipped,
+                    received_quantity=received if received is not None else 0,
+                    pending_quantity=pending,
+                    resolved_quantity=resolved,
+                    reason=reason if reason else "未说明",
+                )
+            )
+        return status, lines
