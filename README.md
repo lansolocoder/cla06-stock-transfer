@@ -100,3 +100,34 @@ python3 -m stock_transfer cancel --transfer TR-001 --reason 客户撤单
 `--transfer` 去空白后为空，统一写 stderr、退出码 1、stdout 为空且台账不变。
 取消成功后不能再对该单收货确认。状态字面值精确为 `canceled`，不做大小写或拼写变体
 兼容。
+
+## 盘点调整
+
+按仓库+商品对单个批次修正现存数量，并把修正原因留存备查：
+
+```bash
+python3 -m stock_transfer adjust \
+    --warehouse WH-A --product SKU-1001 \
+    --batch LOT-2024-001 --delta -3 --reason 盘点损耗
+```
+
+`--delta` 为带符号非零整数（如 `-3` 或 `+2`），`--reason` 去空白后非空。成功时按
+delta 原子修改该批次现存数量（生产日期与有效期至不变；调整为 0 时该批次行按既有
+惯例移除），输出一行仓库、商品、批次号、调整量与调整后数量（十进制整数）。批次号
+在同一仓库同一商品内精确匹配唯一批次，不接受模糊匹配或大小写变体；调整不影响其他
+仓库或其他商品的同名批次，也不改动任何调拨单及其状态。批次不存在、delta 为 0 或
+非整数、reason 去空白为空、调整后数量小于 0，统一写 stderr、退出码 1、stdout 为
+空且台账不变（不产生负库存）。
+
+## 盘点记录查询
+
+按仓库+商品列出历次盘点调整，含批次号、调整量、调整后数量、原因与发生时间
+（`YYYY-MM-DD HH:MM:SS`），按发生时间升序、同一时刻按录入先后；无记录时输出空
+列表，退出码 0：
+
+```bash
+python3 -m stock_transfer adjustments --warehouse WH-A --product SKU-1001
+```
+
+与其他命令一致，可用 `--db` 指定台账路径；成功与查询结果写 stdout，各失败情形写
+stderr、stdout 为空且退出码 1。

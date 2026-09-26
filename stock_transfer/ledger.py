@@ -43,6 +43,17 @@ class ShipLine:
     quantity: int
 
 
+@dataclass(frozen=True)
+class AdjustmentRecord:
+    """One persisted stocktake adjustment row."""
+
+    lot: str
+    delta: int
+    quantity_after: int
+    reason: str
+    occurred_at: str  # YYYY-MM-DD HH:MM:SS
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_batches (
     id INTEGER PRIMARY KEY,
@@ -71,6 +82,16 @@ CREATE TABLE IF NOT EXISTS transfer_lines (
     shipped_quantity INTEGER NOT NULL CHECK (shipped_quantity > 0),
     received_quantity INTEGER,
     UNIQUE (transfer_no, lot)
+);
+CREATE TABLE IF NOT EXISTS stock_adjustments (
+    id INTEGER PRIMARY KEY,
+    warehouse TEXT NOT NULL,
+    product TEXT NOT NULL,
+    lot TEXT NOT NULL,
+    delta INTEGER NOT NULL,
+    quantity_after INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
 );
 """
 
@@ -135,6 +156,80 @@ class Ledger:
             (warehouse, product),
         )
         return [BatchRecord(*row) for row in rows]
+
+    def adjust_batch(
+        self,
+        warehouse: str,
+        product: str,
+        lot: str,
+        delta: int,
+        reason: str,
+        occurred_at: str,
+    ) -> int:
+        """Apply a stocktake adjustment to one lot; return the new quantity.
+
+        The lot's on-hand quantity is changed by ``delta`` (its production
+        and expiry dates stay untouched) and the adjustment is recorded for
+        audit, all in one transaction. A lot that does not exist under this
+        warehouse+product, or a result below zero, raises LedgerError and
+        leaves the ledger untouched. A result of exactly zero removes the
+        batch row, matching how shipments consume a lot.
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT quantity FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (warehouse, product, lot),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(
+                        f"批次 {lot} 在仓库 {warehouse} 商品 {product} 下不存在"
+                    )
+                on_hand = row[0]
+                new_quantity = on_hand + delta
+                if new_quantity < 0:
+                    raise LedgerError(
+                        f"批次 {lot} 现存数量 {on_hand} 调整 {delta} 后为 "
+                        f"{new_quantity}，不允许负库存"
+                    )
+                if new_quantity == 0:
+                    self._conn.execute(
+                        "DELETE FROM stock_batches "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (warehouse, product, lot),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE stock_batches SET quantity = ? "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (new_quantity, warehouse, product, lot),
+                    )
+                self._conn.execute(
+                    "INSERT INTO stock_adjustments "
+                    "(warehouse, product, lot, delta, quantity_after, reason, "
+                    " occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (warehouse, product, lot, delta, new_quantity, reason,
+                     occurred_at),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"盘点调整失败：{exc}") from exc
+        return new_quantity
+
+    def list_adjustments(
+        self, warehouse: str, product: str
+    ) -> list[AdjustmentRecord]:
+        """List adjustment records for warehouse+product, oldest first.
+
+        Rows sharing the same timestamp are ordered by insertion order.
+        """
+        rows = self._conn.execute(
+            "SELECT lot, delta, quantity_after, reason, occurred_at "
+            "FROM stock_adjustments WHERE warehouse = ? AND product = ? "
+            "ORDER BY occurred_at, id",
+            (warehouse, product),
+        )
+        return [AdjustmentRecord(*row) for row in rows]
 
     def ship_transfer(
         self,

@@ -7,7 +7,7 @@ import re
 import sqlite3
 import sys
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from . import __version__
@@ -21,6 +21,7 @@ from .ledger import (
     ShipLine,
 )
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DELTA_RE = re.compile(r"^[+-]?\d+$")
 
 
 def _parse_iso_date(value: str) -> date | None:
@@ -153,7 +154,7 @@ def _validate_transfer_lines(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认与调拨取消。",
+        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认、调拨取消与盘点调整。",
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -168,7 +169,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 -m stock_transfer receive --transfer TR-001 \\\n"
             "      --line LOT-2024-001,8\n"
             "  python3 -m stock_transfer cancel --transfer TR-001 "
-            "--reason 客户撤单"
+            "--reason 客户撤单\n"
+            "  python3 -m stock_transfer adjust --warehouse WH-A "
+            "--product SKU-1001 \\\n"
+            "      --batch LOT-2024-001 --delta -3 --reason 盘点损耗\n"
+            "  python3 -m stock_transfer adjustments --warehouse WH-A "
+            "--product SKU-1001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -295,6 +301,59 @@ def _build_parser() -> argparse.ArgumentParser:
         help="取消原因，去空白后不能为空（仅校验，不参与输出）",
     )
     cancel.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjust = subparsers.add_parser(
+        "adjust",
+        help="按仓库+商品对单个批次做盘点调整并留存原因",
+        description=(
+            "对指定仓库、商品下的一个批次按 --delta 修正现存数量（带符号非零"
+            "整数，如 -3 或 +2），批次的生产日期与有效期至不变；--reason 去"
+            "空白后非空并随调整记录留存备查。批次不存在、调整后数量小于 0 或"
+            "参数不合法则整次拒绝，台账不变。"
+        ),
+    )
+    adjust.add_argument("--warehouse", required=True, help="仓库代码")
+    adjust.add_argument("--product", required=True, help="商品代码")
+    adjust.add_argument(
+        "--batch",
+        required=True,
+        metavar="批次号",
+        help="批次号，精确匹配该仓库该商品下的唯一批次",
+    )
+    adjust.add_argument(
+        "--delta",
+        required=True,
+        metavar="调整量",
+        help="带符号非零整数（如 -3 或 +2），调整后数量不得小于 0",
+    )
+    adjust.add_argument(
+        "--reason",
+        required=True,
+        metavar="原因",
+        help="调整原因，去空白后非空，校验通过后留存备查",
+    )
+    adjust.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjustments = subparsers.add_parser(
+        "adjustments",
+        help="按仓库+商品列出历次盘点调整记录",
+        description=(
+            "列出指定仓库、商品下的全部盘点调整记录：批次号、调整量、调整后"
+            "数量、原因与发生时间（YYYY-MM-DD HH:MM:SS），按发生时间升序，"
+            "同一时刻按录入先后；无记录时输出空列表，退出码 0。"
+        ),
+    )
+    adjustments.add_argument("--warehouse", required=True, help="仓库代码")
+    adjustments.add_argument("--product", required=True, help="商品代码")
+    adjustments.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -454,6 +513,85 @@ def _run_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_adjust(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    lot = args.batch.strip()
+    reason = args.reason.strip()
+
+    errors: list[str] = []
+    if not warehouse:
+        errors.append("仓库代码去首尾空白后不能为空")
+    if not product:
+        errors.append("商品代码去首尾空白后不能为空")
+    if not lot:
+        errors.append("批次号去首尾空白后不能为空")
+
+    delta_raw = args.delta.strip()
+    delta: int | None = None
+    if not _DELTA_RE.match(delta_raw):
+        errors.append(
+            f"调整量 {args.delta!r} 必须为带符号非零整数（如 -3 或 +2）"
+        )
+    else:
+        delta = int(delta_raw)
+        if delta == 0:
+            errors.append("调整量不能为 0")
+
+    if not reason:
+        errors.append("调整原因去首尾空白后不能为空")
+
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    assert delta is not None
+    db_path = _db_path(args)
+    occurred_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with Ledger.open(db_path) as ledger:
+            new_quantity = ledger.adjust_batch(
+                warehouse, product, lot, delta, reason, occurred_at
+            )
+    except LedgerError as exc:
+        print(f"盘点调整失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"调整成功：仓库={warehouse} 商品={product} 批次号={lot} "
+        f"调整量={delta} 调整后数量={new_quantity}"
+    )
+    return 0
+
+
+def _run_adjustments(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    if not db_path.exists():
+        records = []
+    else:
+        with Ledger.open(db_path) as ledger:
+            records = ledger.list_adjustments(warehouse, product)
+
+    print(f"仓库={warehouse} 商品={product} 调整记录数={len(records)}")
+    for record in records:
+        print(
+            f"批次号={record.lot} 调整量={record.delta} "
+            f"调整后数量={record.quantity_after} 原因={record.reason} "
+            f"时间={record.occurred_at}"
+        )
+    return 0
+
+
 def _run_query(args: argparse.Namespace) -> int:
     warehouse = args.warehouse.strip()
     product = args.product.strip()
@@ -499,5 +637,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_receive(args)
     if args.command == "cancel":
         return _run_cancel(args)
+    if args.command == "adjust":
+        return _run_adjust(args)
+    if args.command == "adjustments":
+        return _run_adjustments(args)
     parser.print_help()
     return 0
