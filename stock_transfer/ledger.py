@@ -44,6 +44,16 @@ class ShipLine:
     quantity: int
 
 
+@dataclass(frozen=True)
+class TransferLineRecord:
+    """One persisted transfer line, in the order it was shipped."""
+
+    lot: str
+    shipped_quantity: int
+    received_quantity: int | None  # None while receipt is unconfirmed
+    resolved_quantity: int
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_batches (
     id INTEGER PRIMARY KEY,
@@ -152,6 +162,26 @@ class Ledger:
             (warehouse, product),
         )
         return [BatchRecord(*row) for row in rows]
+
+    def transfer_detail(
+        self, transfer_no: str
+    ) -> tuple[str, list[TransferLineRecord]] | None:
+        """Return (status, lines in original order) for a transfer, or None.
+
+        Read-only: the ledger is never modified by this lookup.
+        """
+        row = self._conn.execute(
+            "SELECT status FROM transfers WHERE transfer_no = ?",
+            (transfer_no,),
+        ).fetchone()
+        if row is None:
+            return None
+        lines = self._conn.execute(
+            "SELECT lot, shipped_quantity, received_quantity, resolved_quantity "
+            "FROM transfer_lines WHERE transfer_no = ? ORDER BY seq",
+            (transfer_no,),
+        )
+        return row[0], [TransferLineRecord(*line) for line in lines]
 
     def ship_transfer(
         self,

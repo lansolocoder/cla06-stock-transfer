@@ -130,3 +130,27 @@ python3 -m stock_transfer cancel --transfer TR-001 --reason 客户撤单
 `--transfer` 去空白后为空，统一写 stderr、退出码 1、stdout 为空且台账不变。
 取消成功后不能再对该单收货确认。状态字面值精确为 `canceled`，不做大小写或拼写变体
 兼容。
+
+## 调拨单明细对账
+
+按调拨行的原始先后顺序逐行输出一张调拨单每个调拨行的对账信息（只读查询，不修改台账）：
+
+```bash
+python3 -m stock_transfer detail --transfer TR-001
+```
+
+每行一个调拨行，字段与顺序固定：
+
+```text
+调拨单号=TR-001 状态=shipped 批次号=LOT-2024-001 发运数量=10 实收数量=未收货 挂账差异=0 已结案=0
+调拨单号=TR-001 状态=received-with-diff 批次号=LOT-2024-002 发运数量=5 实收数量=3 挂账差异=2 已结案=0
+```
+
+状态字面值精确为 `shipped`、`received`、`received-with-diff`、`resolved`、`canceled`。
+某调拨行尚未确认收货时 `实收数量` 显示字面值 `未收货`，此时 `挂账差异` 与 `已结案`
+均为 0；确认收货后 `实收数量` 为数字，`挂账差异=发运数量-实收数量-已结案数量`。
+全部字段按原样输出，不做补齐或四舍五入。
+
+`--transfer` 去空白后为空、调拨单不存在、或未指定 `--db` 且当前目录无
+`stock_ledger.db` 时，写 stderr、退出码 1、stdout 为空，且不会因此创建台账文件；
+查询成功退出码为 0。

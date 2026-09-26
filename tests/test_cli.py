@@ -1012,5 +1012,217 @@ class ResolveCommandTests(unittest.TestCase):
             self.assertEqual(self.order_state(cwd, "TR-2")[0], "resolved")
 
 
+class DetailCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", "SKU-1",
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def ship(self, cwd: Path, transfer: str, *lines: str) -> None:
+        arguments = [
+            "ship", "--transfer", transfer,
+            "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+        ]
+        for line in lines:
+            arguments += ["--line", line]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def detail(self, cwd: Path, transfer: str,
+               db: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = ["detail", "--transfer", transfer]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def test_detail_of_shipped_order_marks_lines_unreceived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.ship(cwd, "TR-1", "LOT-1,6", "LOT-2,8")
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "调拨单号=TR-1 状态=shipped 批次号=LOT-1 发运数量=6 "
+                    "实收数量=未收货 挂账差异=0 已结案=0",
+                    "调拨单号=TR-1 状态=shipped 批次号=LOT-2 发运数量=8 "
+                    "实收数量=未收货 挂账差异=0 已结案=0",
+                ],
+            )
+
+    def test_detail_tracks_receipt_and_partial_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.ship(cwd, "TR-1", "LOT-1,7", "LOT-2,8")
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "receive", "--transfer", "TR-1",
+                    "--line", "LOT-1,5", "--line", "LOT-2,5",
+                ).returncode,
+                0,
+            )
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "调拨单号=TR-1 状态=received-with-diff 批次号=LOT-1 "
+                    "发运数量=7 实收数量=5 挂账差异=2 已结案=0",
+                    "调拨单号=TR-1 状态=received-with-diff 批次号=LOT-2 "
+                    "发运数量=8 实收数量=5 挂账差异=3 已结案=0",
+                ],
+            )
+
+            # Partial resolution: LOT-1 closes 2, LOT-2 keeps 3 pending.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "resolve", "--transfer", "TR-1", "--line", "LOT-1,2"
+                ).returncode,
+                0,
+            )
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "调拨单号=TR-1 状态=received-with-diff 批次号=LOT-1 "
+                    "发运数量=7 实收数量=5 挂账差异=0 已结案=2",
+                    "调拨单号=TR-1 状态=received-with-diff 批次号=LOT-2 "
+                    "发运数量=8 实收数量=5 挂账差异=3 已结案=0",
+                ],
+            )
+
+            # Full resolution flips the status to resolved.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "resolve", "--transfer", "TR-1"
+                ).returncode,
+                0,
+            )
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "调拨单号=TR-1 状态=resolved 批次号=LOT-1 "
+                    "发运数量=7 实收数量=5 挂账差异=0 已结案=2",
+                    "调拨单号=TR-1 状态=resolved 批次号=LOT-2 "
+                    "发运数量=8 实收数量=5 挂账差异=0 已结案=3",
+                ],
+            )
+
+    def test_detail_of_fully_received_and_canceled_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.ship(cwd, "TR-1", "LOT-1,6")
+            self.ship(cwd, "TR-2", "LOT-2,8")
+            self.assertEqual(
+                self.invoke_in(cwd, "receive", "--transfer", "TR-1").returncode, 0
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "cancel", "--transfer", "TR-2", "--reason", "撤单"
+                ).returncode,
+                0,
+            )
+
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "调拨单号=TR-1 状态=received 批次号=LOT-1 发运数量=6 "
+                "实收数量=6 挂账差异=0 已结案=0",
+            )
+
+            result = self.detail(cwd, "TR-2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "调拨单号=TR-2 状态=canceled 批次号=LOT-2 发运数量=8 "
+                "实收数量=0 挂账差异=8 已结案=0",
+            )
+
+    def test_detail_rejections_never_create_a_ledger_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+
+            # Blank transfer number.
+            result = self.detail(cwd, "   ")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("调拨单号", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            # No --db and no stock_ledger.db in the working directory.
+            result = self.detail(cwd, "TR-1")
+            self.assertEqual(result.returncode, 1)
+            self.assertNotEqual(result.stderr, "")
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+            # Explicit --db pointing at a missing file: treated as unknown
+            # transfer, still without creating the file.
+            missing = str(cwd / "nested" / "ledger.db")
+            result = self.detail(cwd, "TR-1", db=missing)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((cwd / "nested").exists())
+
+            # Ledger exists but the transfer does not.
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10")
+            result = self.detail(cwd, "TR-X")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_detail_respects_custom_db_path_and_stays_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "nested" / "ledger.db")
+            (cwd / "nested").mkdir()
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1,2024-03-01,2025-03-01,10", "--db", db,
+            )
+            self.invoke_in(
+                cwd, "ship", "--transfer", "TR-1",
+                "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                "--line", "LOT-1,6", "--db", db,
+            )
+
+            before = Path(db).read_bytes()
+            result = self.detail(cwd, " TR-1 ", db=db)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "调拨单号=TR-1 状态=shipped 批次号=LOT-1 发运数量=6 "
+                "实收数量=未收货 挂账差异=0 已结案=0",
+            )
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+            self.assertEqual(Path(db).read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
