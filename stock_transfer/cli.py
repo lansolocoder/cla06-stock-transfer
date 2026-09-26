@@ -15,6 +15,7 @@ from .ledger import (
     DEFAULT_DB_FILENAME,
     STATUS_RECEIVED,
     STATUS_RECEIVED_WITH_DIFF,
+    AdjustLine,
     BatchInput,
     Ledger,
     LedgerError,
@@ -22,6 +23,7 @@ from .ledger import (
     ShipLine,
 )
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DELTA_RE = re.compile(r"^[+-]?\d+$")
 
 
 def _parse_iso_date(value: str) -> date | None:
@@ -200,10 +202,62 @@ def _validate_resolve_lines(
     return parsed, errors
 
 
+def _validate_adjust_lines(
+    raw_lines: Sequence[str],
+) -> tuple[list[tuple[int, AdjustLine]], list[str]]:
+    """Validate lines of the form ``批次号,数量变化[,原因]``.
+
+    Return (line number, adjust line) pairs and errors; callers reject the
+    whole command whenever the error list is non-empty. The quantity delta
+    must be a non-zero integer; a missing or blank reason is recorded as
+    未说明; more than three fields is a format error.
+    """
+    parsed: list[tuple[int, AdjustLine]] = []
+    errors: list[str] = []
+    seen_lots: dict[str, int] = {}
+
+    for index, raw in enumerate(raw_lines, start=1):
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) < 2 or len(parts) > 3:
+            errors.append(
+                f"调整行 {index}: 调整行格式错误，应为“批次号,数量变化[,原因]”"
+            )
+            continue
+
+        lot, delta_raw = parts[0], parts[1]
+        reason = parts[2] if len(parts) == 3 and parts[2] else "未说明"
+        line_ok = True
+
+        if not lot:
+            errors.append(f"调整行 {index}: 批次号不能为空")
+            line_ok = False
+
+        if not _DELTA_RE.match(delta_raw) or int(delta_raw) == 0:
+            errors.append(
+                f"调整行 {index}: 数量变化 {delta_raw!r} 必须为非零整数"
+            )
+            line_ok = False
+
+        if not line_ok:
+            continue
+
+        adjust_line = AdjustLine(lot, int(delta_raw), reason)
+        parsed.append((index, adjust_line))
+        first_line = seen_lots.get(lot)
+        if first_line is None:
+            seen_lots[lot] = index
+        else:
+            errors.append(
+                f"调整行 {index}: 批次号 {lot} 与调整行 {first_line} 重复"
+            )
+
+    return parsed, errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认、调拨取消、差异结清与差异查询。",
+        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认、调拨取消、差异结清、差异查询与盘点调整。",
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -221,7 +275,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "--reason 客户撤单\n"
             "  python3 -m stock_transfer resolve --transfer TR-001 \\\n"
             "      --line LOT-2024-001,2,运输损耗\n"
-            "  python3 -m stock_transfer diff --transfer TR-001"
+            "  python3 -m stock_transfer diff --transfer TR-001\n"
+            "  python3 -m stock_transfer adjust --warehouse WH-A \\\n"
+            "      --product SKU-1001 \\\n"
+            "      --line LOT-2024-001,-2,盘点损耗 \\\n"
+            "      --line LOT-2024-002,3\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -394,6 +452,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transfer", required=True, metavar="调拨单号", help="待查询的调拨单号"
     )
     diff.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjust = subparsers.add_parser(
+        "adjust",
+        help="盘点后直接修正指定仓库、商品下批次的现存数量（整次原子落账）",
+        description=(
+            "整次提交一次落账；任一行不合法则全部拒绝、台账不变。调整行格式："
+            "批次号,数量变化[,原因]（数量变化为非零整数，正数增加、负数减少；"
+            "减少后数量不能为负，减到 0 时该批次行从台账删除；原因缺省或去空白"
+            "后为空记为 未说明；字段超过 3 个视为格式错误）。只改动批次现存"
+            "数量，不影响任何调拨单的状态或差异数据。"
+        ),
+    )
+    adjust.add_argument("--warehouse", required=True, help="仓库代码")
+    adjust.add_argument("--product", required=True, help="商品代码")
+    adjust.add_argument(
+        "--line",
+        required=True,
+        action="append",
+        metavar="批次号,数量变化[,原因]",
+        help="调整行，可重复提供；批次号定位该仓库该商品下的现存批次行",
+    )
+    adjust.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -610,6 +694,41 @@ def _run_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_adjust(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+
+    errors: list[str] = []
+    if not warehouse:
+        errors.append("仓库代码去首尾空白后不能为空")
+    if not product:
+        errors.append("商品代码去首尾空白后不能为空")
+
+    parsed, line_errors = _validate_adjust_lines(args.line)
+    errors.extend(line_errors)
+
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    try:
+        with Ledger.open(db_path) as ledger:
+            net = ledger.adjust_batches(
+                warehouse, product, [line for _, line in parsed]
+            )
+    except LedgerError as exc:
+        print(f"盘点调整失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"盘点调整成功：仓库={warehouse} 商品={product} "
+        f"调整批次={len(parsed)} 净变化={net}"
+    )
+    return 0
+
+
 def _run_query(args: argparse.Namespace) -> int:
     warehouse = args.warehouse.strip()
     product = args.product.strip()
@@ -659,5 +778,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_resolve(args)
     if args.command == "diff":
         return _run_diff(args)
+    if args.command == "adjust":
+        return _run_adjust(args)
     parser.print_help()
     return 0

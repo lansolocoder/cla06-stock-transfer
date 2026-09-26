@@ -1005,5 +1005,216 @@ class DiffCommandTests(unittest.TestCase):
             self.assertFalse((cwd / "stock_ledger.db").exists())
 
 
+class AdjustCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", "SKU-1",
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def adjust(self, cwd: Path, *lines: str,
+               warehouse: str = "WH-A", product: str = "SKU-1",
+               db: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "adjust", "--warehouse", warehouse, "--product", product,
+        ]
+        for line in lines:
+            arguments += ["--line", line]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def query_quantities(self, cwd: Path, warehouse: str) -> dict[str, int]:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", "SKU-1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        quantities: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            match = re.match(r"批次号=(\S+) .*数量=(\d+)$", line)
+            if match:
+                quantities[match[1]] = int(match[2])
+        return quantities
+
+    def test_adjust_increase_and_decrease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+
+            result = self.adjust(cwd, "LOT-1,5,盘盈", "LOT-2,-3,盘点损耗")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                result.stdout.strip(),
+                "盘点调整成功：仓库=WH-A 商品=SKU-1 调整批次=2 净变化=2",
+            )
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-A"), {"LOT-1": 15, "LOT-2": 5}
+            )
+
+            # Reasons are recorded per line, blank ones as 未说明.
+            conn = sqlite3.connect(cwd / "stock_ledger.db")
+            try:
+                rows = conn.execute(
+                    "SELECT lot, delta, reason FROM stock_adjustments "
+                    "ORDER BY id"
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(
+                rows, [("LOT-1", 5, "盘盈"), ("LOT-2", -3, "盘点损耗")]
+            )
+
+    def test_adjust_to_zero_deletes_batch_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+
+            result = self.adjust(cwd, "LOT-1,-10")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整批次=1 净变化=-10", result.stdout)
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {"LOT-2": 8})
+
+            # The cleared batch no longer exists: any further adjustment is
+            # rejected, and re-registering the lot is allowed again.
+            result = self.adjust(cwd, "LOT-1,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.register(cwd, "WH-A", "LOT-1,2024-05-01,2025-05-01,4")
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-A"), {"LOT-1": 4, "LOT-2": 8}
+            )
+
+    def test_adjust_rejections_leave_ledger_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            before = self.query_quantities(cwd, "WH-A")
+
+            cases = [
+                # Unknown lot.
+                (("LOT-9,1",), "不存在"),
+                # Reduction below zero.
+                (("LOT-1,-11",), "不足"),
+                # Duplicate lot within one command: rejected, not aggregated.
+                (("LOT-1,1", "LOT-1,2"), "重复"),
+                # Zero / non-numeric delta.
+                (("LOT-1,0",), "非零整数"),
+                (("LOT-1,abc",), "非零整数"),
+                (("LOT-1,1.5",), "非零整数"),
+                # More than three fields / missing delta field.
+                (("LOT-1,1,原因,多字段",), "格式"),
+                (("LOT-1",), "格式"),
+                # Blank lot.
+                ((",1",), "批次号"),
+            ]
+            for lines, hint in cases:
+                with self.subTest(lines=lines):
+                    result = self.adjust(cwd, *lines)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # Blank warehouse / product codes.
+            result = self.adjust(cwd, "LOT-1,1", warehouse="  ")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("仓库代码", result.stderr)
+            result = self.adjust(cwd, "LOT-1,1", product=" ")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("商品代码", result.stderr)
+
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), before)
+
+            # One bad line rejects the whole submission atomically.
+            result = self.adjust(cwd, "LOT-1,5", "LOT-9,1")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), before)
+
+            # The ledger is still adjustable after the failed attempts.
+            result = self.adjust(cwd, "LOT-1,5")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                self.query_quantities(cwd, "WH-A"),
+                {"LOT-1": 15, "LOT-2": 8},
+            )
+
+    def test_adjust_does_not_touch_transfers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-1,2024-03-01,2025-03-01,10",
+                          "LOT-2,2024-04-02,2025-04-02,8")
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "ship", "--transfer", "TR-1",
+                    "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                    "--line", "LOT-1,7", "--line", "LOT-2,8",
+                ).returncode,
+                0,
+            )
+            # Adjust the very lots an in-flight transfer references:
+            # LOT-1 had 3 left at the source, clearing it deletes the row.
+            result = self.adjust(cwd, "LOT-1,-3,盘点损耗")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.query_quantities(cwd, "WH-A"), {})
+
+            # Receipt with a difference still works exactly as before.
+            result = self.invoke_in(
+                cwd, "receive", "--transfer", "TR-1", "--line", "LOT-1,5"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("received-with-diff", result.stdout)
+
+            result = self.invoke_in(cwd, "diff", "--transfer", "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "调拨单号=TR-1 状态=received-with-diff 未结差异总数=10",
+                    "批次号=LOT-1 发运数量=7 实收数量=5 未结差异数量=2 "
+                    "已结清数量=0 原因=未说明",
+                    "批次号=LOT-2 发运数量=8 实收数量=0 未结差异数量=8 "
+                    "已结清数量=0 原因=未说明",
+                ],
+            )
+
+            # Resolution is unaffected as well.
+            result = self.invoke_in(
+                cwd, "resolve", "--transfer", "TR-1",
+                "--line", "LOT-1,2,运输损耗", "--line", "LOT-2,8",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=resolved", result.stdout)
+
+    def test_adjust_respects_custom_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "nested.db")
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1,2024-03-01,2025-03-01,10", "--db", db,
+            )
+            result = self.adjust(cwd, "LOT-1,4,盘盈", db=db)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("净变化=4", result.stdout)
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
