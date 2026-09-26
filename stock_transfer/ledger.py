@@ -54,6 +54,15 @@ class ResolveLine:
 
 
 @dataclass(frozen=True)
+class AdjustLine:
+    """One stocktake-adjustment line: which lot, signed quantity change, reason."""
+
+    lot: str
+    delta: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class DiffLine:
     """One transfer line's difference breakdown for the diff query."""
 
@@ -95,6 +104,15 @@ CREATE TABLE IF NOT EXISTS transfer_lines (
     resolved_quantity INTEGER NOT NULL DEFAULT 0,
     resolved_reason TEXT,
     UNIQUE (transfer_no, lot)
+);
+CREATE TABLE IF NOT EXISTS stock_adjustments (
+    id INTEGER PRIMARY KEY,
+    warehouse TEXT NOT NULL,
+    product TEXT NOT NULL,
+    lot TEXT NOT NULL,
+    delta INTEGER NOT NULL CHECK (delta <> 0),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -174,6 +192,79 @@ class Ledger:
             (warehouse, product),
         )
         return [BatchRecord(*row) for row in rows]
+
+    def adjust_stock(
+        self,
+        warehouse: str,
+        product: str,
+        adjustments: Sequence[AdjustLine],
+    ) -> int:
+        """Apply a stocktake adjustment atomically; return the net quantity change.
+
+        Each line locates the existing on-hand lot under warehouse+product and
+        adds its signed delta (positive increments, negative decrements). A
+        decrement that brings the lot to exactly 0 clears it: the batch row is
+        deleted, after which any further adjustment for that lot is refused
+        (the lot no longer exists). A negative resulting quantity is rejected.
+        Duplicate lots within one command are rejected rather than aggregated.
+        No transfer order or difference row is ever touched. Any violation
+        raises LedgerError and leaves the ledger untouched.
+        """
+        if not adjustments:
+            raise LedgerError("盘点调整至少需要一行调整行")
+
+        try:
+            with self._conn:
+                # Validate every line against the current ledger before any
+                # write, so a single bad line rejects the whole stocktake.
+                planned: list[tuple[AdjustLine, int]] = []
+                seen_lots: set[str] = set()
+                for line in adjustments:
+                    if line.lot in seen_lots:
+                        raise LedgerError(
+                            f"批次 {line.lot} 在同一盘点命令内重复"
+                        )
+                    seen_lots.add(line.lot)
+                    row = self._conn.execute(
+                        "SELECT quantity FROM stock_batches "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (warehouse, product, line.lot),
+                    ).fetchone()
+                    if row is None:
+                        raise LedgerError(
+                            f"批次 {line.lot} 在仓库 {warehouse} 商品 {product} "
+                            "下不存在"
+                        )
+                    resulting = row[0] + line.delta
+                    if resulting < 0:
+                        raise LedgerError(
+                            f"批次 {line.lot} 调整后数量为 {resulting}，"
+                            "减少数量不能超过现存数量"
+                        )
+                    planned.append((line, resulting))
+
+                for line, resulting in planned:
+                    if resulting == 0:
+                        self._conn.execute(
+                            "DELETE FROM stock_batches "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (warehouse, product, line.lot),
+                        )
+                    else:
+                        self._conn.execute(
+                            "UPDATE stock_batches SET quantity = ? "
+                            "WHERE warehouse = ? AND product = ? AND lot = ?",
+                            (resulting, warehouse, product, line.lot),
+                        )
+                    self._conn.execute(
+                        "INSERT INTO stock_adjustments "
+                        "(warehouse, product, lot, delta, reason) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (warehouse, product, line.lot, line.delta, line.reason),
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"盘点调整失败：{exc}") from exc
+        return sum(line.delta for line in adjustments)
 
     def ship_transfer(
         self,
