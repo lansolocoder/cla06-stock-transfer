@@ -163,6 +163,124 @@ class Ledger:
         )
         return [BatchRecord(*row) for row in rows]
 
+    def merge_batches(
+        self, warehouse: str, product: str, target_lot: str, source_lot: str
+    ) -> int:
+        """Merge *source_lot* into *target_lot* atomically; return merged quantity.
+
+        Both lots must exist under the same warehouse and product. The source
+        row is deleted and its quantity added to the target row; the target
+        row keeps the earlier production date and the earlier expiry date of
+        the two. Only batch rows change — no transfer order or transfer line
+        is touched. Any violation raises LedgerError and leaves the ledger
+        untouched.
+        """
+        try:
+            with self._conn:
+                rows = self._conn.execute(
+                    "SELECT lot, production_date, expiry_date, quantity "
+                    "FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot IN (?, ?)",
+                    (warehouse, product, target_lot, source_lot),
+                ).fetchall()
+                by_lot = {row[0]: row for row in rows}
+                if target_lot not in by_lot:
+                    raise LedgerError(
+                        f"目标批次 {target_lot} 在仓库 {warehouse} "
+                        f"商品 {product} 下不存在"
+                    )
+                if source_lot not in by_lot:
+                    raise LedgerError(
+                        f"来源批次 {source_lot} 在仓库 {warehouse} "
+                        f"商品 {product} 下不存在"
+                    )
+                _, target_prod, target_exp, target_qty = by_lot[target_lot]
+                _, source_prod, source_exp, source_qty = by_lot[source_lot]
+                self._conn.execute(
+                    "UPDATE stock_batches "
+                    "SET quantity = ?, production_date = ?, expiry_date = ? "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (
+                        target_qty + source_qty,
+                        min(target_prod, source_prod),
+                        min(target_exp, source_exp),
+                        warehouse,
+                        product,
+                        target_lot,
+                    ),
+                )
+                self._conn.execute(
+                    "DELETE FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (warehouse, product, source_lot),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"批次合并失败：{exc}") from exc
+        return source_qty
+
+    def split_batch(
+        self,
+        warehouse: str,
+        product: str,
+        lot: str,
+        new_lot: str,
+        quantity: int,
+    ) -> None:
+        """Split *quantity* off *lot* into a new batch row *new_lot*, atomically.
+
+        The original row's quantity is reduced by *quantity* (which must be a
+        positive integer smaller than the on-hand quantity) and a new row is
+        appended under *new_lot* with the original batch's production and
+        expiry dates. *new_lot* must not collide with any existing lot under
+        the same warehouse and product. Only batch rows change — no transfer
+        order or transfer line is touched. Any violation raises LedgerError
+        and leaves the ledger untouched.
+        """
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT production_date, expiry_date, quantity "
+                    "FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (warehouse, product, lot),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(
+                        f"批次 {lot} 在仓库 {warehouse} 商品 {product} 下不存在"
+                    )
+                production_date, expiry_date, on_hand = row
+                if quantity <= 0:
+                    raise LedgerError(f"拆分数量 {quantity} 必须为正整数")
+                if quantity >= on_hand:
+                    raise LedgerError(
+                        f"拆分数量 {quantity} 必须小于批次 {lot} "
+                        f"现存数量 {on_hand}"
+                    )
+                conflict = self._conn.execute(
+                    "SELECT 1 FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (warehouse, product, new_lot),
+                ).fetchone()
+                if conflict is not None:
+                    raise LedgerError(
+                        f"新批次号 {new_lot} 已在仓库 {warehouse} "
+                        f"商品 {product} 下落账"
+                    )
+                self._conn.execute(
+                    "UPDATE stock_batches SET quantity = quantity - ? "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (quantity, warehouse, product, lot),
+                )
+                self._conn.execute(
+                    "INSERT INTO stock_batches "
+                    "(warehouse, product, lot, production_date, expiry_date, "
+                    " quantity) VALUES (?, ?, ?, ?, ?, ?)",
+                    (warehouse, product, new_lot, production_date, expiry_date,
+                     quantity),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"批次拆分失败：{exc}") from exc
+
     def get_transfer_detail(
         self, transfer_no: str
     ) -> tuple[str, list[TransferDetailLine]] | None:

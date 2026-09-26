@@ -1288,5 +1288,279 @@ class DetailCommandTests(unittest.TestCase):
                 conn.close()
 
 
+class BatchAdjustCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, *batches: str,
+                 product: str = "SKU-1") -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", product,
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def merge(self, cwd: Path, target: str, source: str,
+              warehouse: str = "WH-A", product: str = "SKU-1",
+              db: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "merge-batch", "--warehouse", warehouse, "--product", product,
+            "--target", target, "--source", source,
+        ]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def split(self, cwd: Path, batch: str, new_batch: str, qty: str,
+              warehouse: str = "WH-A", product: str = "SKU-1",
+              db: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "split-batch", "--warehouse", warehouse, "--product", product,
+            "--batch", batch, "--new-batch", new_batch, "--qty", qty,
+        ]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def stock_rows(self, cwd: Path) -> list[tuple]:
+        conn = sqlite3.connect(cwd / "stock_ledger.db")
+        try:
+            return conn.execute(
+                "SELECT warehouse, product, lot, production_date, "
+                "expiry_date, quantity FROM stock_batches ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def transfer_rows(self, cwd: Path) -> tuple[list[tuple], list[tuple]]:
+        conn = sqlite3.connect(cwd / "stock_ledger.db")
+        try:
+            orders = conn.execute(
+                "SELECT transfer_no, status, total_quantity, diff_total "
+                "FROM transfers"
+            ).fetchall()
+            lines = conn.execute(
+                "SELECT transfer_no, seq, lot, shipped_quantity, "
+                "received_quantity, resolved_quantity "
+                "FROM transfer_lines ORDER BY transfer_no, seq"
+            ).fetchall()
+            return orders, lines
+        finally:
+            conn.close()
+
+    def query_stdout(self, cwd: Path, warehouse: str = "WH-A",
+                     product: str = "SKU-1") -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", product
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_merge_combines_quantities_and_keeps_earlier_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(
+                cwd, "WH-A",
+                "LOT-A,2024-03-01,2025-03-01,18",
+                "LOT-B,2024-01-15,2024-12-31,12",
+                "LOT-C,2024-05-01,2026-05-01,7",
+            )
+            result = self.merge(cwd, "LOT-A", "LOT-B")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout,
+                "合并成功：目标批次=LOT-A 来源批次=LOT-B 合并数量=12\n",
+            )
+            self.assertEqual(result.stderr, "")
+
+            self.assertEqual(
+                self.stock_rows(cwd),
+                [
+                    ("WH-A", "SKU-1", "LOT-A", "2024-01-15", "2024-12-31", 30),
+                    ("WH-A", "SKU-1", "LOT-C", "2024-05-01", "2026-05-01", 7),
+                ],
+            )
+            stdout = self.query_stdout(cwd)
+            self.assertIn("批次总数=2", stdout)
+            self.assertIn("批次号=LOT-A 生产日期=2024-01-15 "
+                          "有效期至=2024-12-31 数量=30", stdout)
+            self.assertNotIn("LOT-B", stdout)
+
+    def test_merge_leaves_other_warehouses_and_products_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-A,2024-03-01,2025-03-01,10",
+                          "LOT-B,2024-04-01,2025-04-01,5")
+            self.register(cwd, "WH-B", "LOT-B,2024-06-01,2026-06-01,9")
+            self.register(cwd, "WH-A", "LOT-B,2024-07-01,2026-07-01,4",
+                          product="SKU-2")
+
+            result = self.merge(cwd, "LOT-A", "LOT-B")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                self.stock_rows(cwd),
+                [
+                    ("WH-A", "SKU-1", "LOT-A", "2024-03-01", "2025-03-01", 15),
+                    ("WH-B", "SKU-1", "LOT-B", "2024-06-01", "2026-06-01", 9),
+                    ("WH-A", "SKU-2", "LOT-B", "2024-07-01", "2026-07-01", 4),
+                ],
+            )
+
+    def test_merge_failures_leave_ledger_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-A,2024-03-01,2025-03-01,10",
+                          "LOT-B,2024-04-01,2025-04-01,5")
+            self.register(cwd, "WH-B", "LOT-C,2024-06-01,2026-06-01,9")
+            before = self.stock_rows(cwd)
+
+            cases = [
+                # Unknown target / source lots.
+                (("LOT-Z", "LOT-B"), "不存在"),
+                (("LOT-A", "LOT-Z"), "不存在"),
+                # A lot that only exists in another warehouse.
+                (("LOT-A", "LOT-C"), "不存在"),
+                # Same lot twice, and blank lot numbers.
+                (("LOT-A", "LOT-A"), "不能相同"),
+                (("  ", "LOT-B"), "不能为空"),
+                (("LOT-A", " "), "不能为空"),
+            ]
+            for (target, source), message in cases:
+                with self.subTest(target=target, source=source):
+                    result = self.merge(cwd, target, source)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(message, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(self.stock_rows(cwd), before)
+
+    def test_split_reduces_original_and_appends_new_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-A,2024-03-01,2025-03-01,18",
+                          "LOT-B,2024-04-01,2025-04-01,5")
+            result = self.split(cwd, "LOT-A", "LOT-C", "5")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout,
+                "拆分成功：原批次=LOT-A 新批次=LOT-C 拆分数量=5\n",
+            )
+            self.assertEqual(result.stderr, "")
+
+            self.assertEqual(
+                self.stock_rows(cwd),
+                [
+                    ("WH-A", "SKU-1", "LOT-A", "2024-03-01", "2025-03-01", 13),
+                    ("WH-A", "SKU-1", "LOT-B", "2024-04-01", "2025-04-01", 5),
+                    ("WH-A", "SKU-1", "LOT-C", "2024-03-01", "2025-03-01", 5),
+                ],
+            )
+            stdout = self.query_stdout(cwd)
+            self.assertIn("批次总数=3", stdout)
+            self.assertIn("批次号=LOT-C 生产日期=2024-03-01 "
+                          "有效期至=2025-03-01 数量=5", stdout)
+
+    def test_split_failures_leave_ledger_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-A,2024-03-01,2025-03-01,10",
+                          "LOT-B,2024-04-01,2025-04-01,5")
+            self.register(cwd, "WH-B", "LOT-C,2024-06-01,2026-06-01,9")
+            before = self.stock_rows(cwd)
+
+            cases = [
+                # Quantity not a positive integer.
+                (("LOT-A", "LOT-N", "0"), "正整数"),
+                (("LOT-A", "LOT-N", "-3"), "正整数"),
+                (("LOT-A", "LOT-N", "abc"), "正整数"),
+                (("LOT-A", "LOT-N", "2.5"), "正整数"),
+                # Quantity not smaller than the on-hand quantity.
+                (("LOT-A", "LOT-N", "10"), "必须小于"),
+                (("LOT-A", "LOT-N", "11"), "必须小于"),
+                # New lot blank or already taken (here or in the batch set).
+                (("LOT-A", "  ", "3"), "不能为空"),
+                (("LOT-A", "LOT-B", "3"), "已在仓库"),
+                (("LOT-A", "LOT-A", "3"), "已在仓库"),
+                # Unknown batch, and a batch that only exists elsewhere.
+                (("LOT-Z", "LOT-N", "3"), "不存在"),
+                (("LOT-C", "LOT-N", "3"), "不存在"),
+            ]
+            for (batch, new_batch, qty), message in cases:
+                with self.subTest(batch=batch, new_batch=new_batch, qty=qty):
+                    result = self.split(cwd, batch, new_batch, qty)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(message, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(self.stock_rows(cwd), before)
+
+    def test_adjustments_do_not_touch_transfers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "LOT-A,2024-03-01,2025-03-01,10",
+                          "LOT-B,2024-04-01,2025-04-01,8")
+            result = self.invoke_in(
+                cwd, "ship", "--transfer", "TR-1",
+                "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                "--line", "LOT-A,4",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            orders_before, lines_before = self.transfer_rows(cwd)
+
+            self.assertEqual(self.merge(cwd, "LOT-A", "LOT-B").returncode, 0)
+            self.assertEqual(self.split(cwd, "LOT-A", "LOT-C", "2").returncode, 0)
+            self.assertEqual(self.transfer_rows(cwd),
+                             (orders_before, lines_before))
+
+            # The split-off batch can be shipped right away.
+            result = self.invoke_in(
+                cwd, "ship", "--transfer", "TR-2",
+                "--from", "WH-A", "--to", "WH-B", "--product", "SKU-1",
+                "--line", "LOT-C,2",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            # detail reflects the transfers exactly as booked.
+            result = self.invoke_in(cwd, "detail", "--transfer", "TR-1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("批次号=LOT-A 发运数量=4", result.stdout)
+
+    def test_adjust_commands_respect_custom_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "nested").mkdir()
+            db = str(cwd / "nested" / "ledger.db")
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-A,2024-03-01,2025-03-01,10",
+                "--batch", "LOT-B,2024-04-01,2025-04-01,5", "--db", db,
+            )
+            self.assertEqual(
+                self.merge(cwd, "LOT-A", "LOT-B", db=db).returncode, 0
+            )
+            self.assertEqual(
+                self.split(cwd, "LOT-A", "LOT-C", "3", db=db).returncode, 0
+            )
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT lot, quantity FROM stock_batches ORDER BY id"
+                    ).fetchall(),
+                    [("LOT-A", 12), ("LOT-C", 3)],
+                )
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

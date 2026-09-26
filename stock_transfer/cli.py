@@ -174,7 +174,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "--reason 客户撤单\n"
             "  python3 -m stock_transfer resolve --transfer TR-001 "
             "--line LOT-2024-001,2\n"
-            "  python3 -m stock_transfer detail --transfer TR-001"
+            "  python3 -m stock_transfer detail --transfer TR-001\n"
+            "  python3 -m stock_transfer merge-batch --warehouse WH-A \\\n"
+            "      --product SKU-1001 --target LOT-2024-001 --source LOT-2024-002\n"
+            "  python3 -m stock_transfer split-batch --warehouse WH-A \\\n"
+            "      --product SKU-1001 --batch LOT-2024-001 \\\n"
+            "      --new-batch LOT-2024-003 --qty 5"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -350,6 +355,63 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transfer", required=True, metavar="调拨单号", help="待查询的调拨单号"
     )
     detail.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    merge_batch = subparsers.add_parser(
+        "merge-batch",
+        help="把同仓同商品下的来源批次并入目标批次",
+        description=(
+            "两个批次必须都存在于该仓该商品下且批次号去空白后非空、不相同。"
+            "合并后来源批次行删除，数量并入目标批次行，生产日期与有效期至均"
+            "取两者较早日期；整次原子落账，任一校验失败则台账不变。"
+        ),
+    )
+    merge_batch.add_argument("--warehouse", required=True, help="仓库代码")
+    merge_batch.add_argument("--product", required=True, help="商品代码")
+    merge_batch.add_argument(
+        "--target", required=True, metavar="目标批次号", help="并入数量的目标批次号"
+    )
+    merge_batch.add_argument(
+        "--source", required=True, metavar="来源批次号", help="被合并删除的来源批次号"
+    )
+    merge_batch.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    split_batch = subparsers.add_parser(
+        "split-batch",
+        help="把同仓同商品下的某批次按数量拆出一个新批次",
+        description=(
+            "数量必须为正整数且小于该批次现存数量；新批次号去空白后非空、"
+            "不与该仓该商品下任何现有批次号相同。拆分后原批次行数量减少，"
+            "追加新批次行（生产日期与有效期至沿用原批次）；整次原子落账，"
+            "任一校验失败则台账不变。"
+        ),
+    )
+    split_batch.add_argument("--warehouse", required=True, help="仓库代码")
+    split_batch.add_argument("--product", required=True, help="商品代码")
+    split_batch.add_argument(
+        "--batch", required=True, metavar="批次号", help="待拆分的原批次号"
+    )
+    split_batch.add_argument(
+        "--new-batch",
+        required=True,
+        dest="new_batch",
+        metavar="新批次号",
+        help="拆分产生的新批次号（该仓该商品下不得已存在）",
+    )
+    split_batch.add_argument(
+        "--qty",
+        required=True,
+        metavar="数量",
+        help="拆分数量（正整数，且小于原批次现存数量）",
+    )
+    split_batch.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -605,6 +667,75 @@ def _run_detail(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_merge_batch(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    target = args.target.strip()
+    source = args.source.strip()
+
+    errors: list[str] = []
+    if not warehouse:
+        errors.append("仓库代码去首尾空白后不能为空")
+    if not product:
+        errors.append("商品代码去首尾空白后不能为空")
+    if not target:
+        errors.append("目标批次号去首尾空白后不能为空")
+    if not source:
+        errors.append("来源批次号去首尾空白后不能为空")
+    if target and source and target == source:
+        errors.append(f"目标批次号与来源批次号不能相同（均为 {target}）")
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    try:
+        with Ledger.open(db_path) as ledger:
+            merged = ledger.merge_batches(warehouse, product, target, source)
+    except LedgerError as exc:
+        print(f"批次合并失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(f"合并成功：目标批次={target} 来源批次={source} 合并数量={merged}")
+    return 0
+
+
+def _run_split_batch(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    lot = args.batch.strip()
+    new_lot = args.new_batch.strip()
+    quantity_raw = args.qty.strip()
+
+    errors: list[str] = []
+    if not warehouse:
+        errors.append("仓库代码去首尾空白后不能为空")
+    if not product:
+        errors.append("商品代码去首尾空白后不能为空")
+    if not lot:
+        errors.append("批次号去首尾空白后不能为空")
+    if not new_lot:
+        errors.append("新批次号去首尾空白后不能为空")
+    if not quantity_raw.isdigit() or int(quantity_raw) <= 0:
+        errors.append(f"拆分数量 {args.qty!r} 必须为正整数")
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    try:
+        with Ledger.open(db_path) as ledger:
+            ledger.split_batch(warehouse, product, lot, new_lot, int(quantity_raw))
+    except LedgerError as exc:
+        print(f"批次拆分失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(f"拆分成功：原批次={lot} 新批次={new_lot} 拆分数量={int(quantity_raw)}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     if argv is None:
@@ -628,5 +759,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_resolve(args)
     if args.command == "detail":
         return _run_detail(args)
+    if args.command == "merge-batch":
+        return _run_merge_batch(args)
+    if args.command == "split-batch":
+        return _run_split_batch(args)
     parser.print_help()
     return 0
