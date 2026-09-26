@@ -21,6 +21,15 @@ from .ledger import (
     ShipLine,
 )
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_SIGNED_INT_RE = re.compile(r"^[+-]?[0-9]+$")
+
+
+def _parse_signed_int(value: str) -> int | None:
+    """Parse a strict signed base-10 integer, or return None if invalid."""
+    text = value.strip()
+    if not _SIGNED_INT_RE.match(text):
+        return None
+    return int(text)
 
 
 def _parse_iso_date(value: str) -> date | None:
@@ -153,7 +162,7 @@ def _validate_transfer_lines(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认与调拨取消。",
+        description="Local 多仓库存台账：库存登记、批次查询、调拨提交、收货确认、调拨取消与盘点调整。",
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -168,7 +177,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 -m stock_transfer receive --transfer TR-001 \\\n"
             "      --line LOT-2024-001,8\n"
             "  python3 -m stock_transfer cancel --transfer TR-001 "
-            "--reason 客户撤单"
+            "--reason 客户撤单\n"
+            "  python3 -m stock_transfer adjust --warehouse WH-A "
+            "--product SKU-1001 \\\n"
+            "      --batch LOT-2024-001 --delta -3 --reason 盘点破损\n"
+            "  python3 -m stock_transfer adjustments --warehouse WH-A "
+            "--product SKU-1001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -295,6 +309,56 @@ def _build_parser() -> argparse.ArgumentParser:
         help="取消原因，去空白后不能为空（仅校验，不参与输出）",
     )
     cancel.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjust = subparsers.add_parser(
+        "adjust",
+        help="按仓库+商品对单个批次做一次盘点数量调整并留存原因",
+        description=(
+            "按仓库+商品精确定位单个批次，用带符号非零整数 --delta 原子修正"
+            "现存数量（生产日期与有效期至不变），并把调整量、调整后数量、"
+            "原因与发生时间留档。批次不存在、delta 为 0 或非整数、原因为空"
+            "或调整后数量小于 0 时整次拒绝，台账不变。"
+        ),
+    )
+    adjust.add_argument("--warehouse", required=True, help="仓库代码")
+    adjust.add_argument("--product", required=True, help="商品代码")
+    adjust.add_argument(
+        "--batch", required=True, metavar="批次号", help="待调整批次号（精确匹配）"
+    )
+    adjust.add_argument(
+        "--delta",
+        required=True,
+        metavar="带符号整数",
+        help="调整量，带符号非零整数，如 -3 或 +2（调整后数量不得小于 0）",
+    )
+    adjust.add_argument(
+        "--reason",
+        required=True,
+        metavar="原因",
+        help="调整原因，去空白后非空，校验通过后留存备查",
+    )
+    adjust.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjustments = subparsers.add_parser(
+        "adjustments",
+        help="按仓库+商品查询历次盘点调整记录（按发生时间升序）",
+        description=(
+            "列出指定仓库、商品下各批次的历次盘点调整：批次号、调整量、"
+            "调整后数量、原因与发生时间（YYYY-MM-DD HH:MM:SS），按发生时间"
+            "升序，同一时刻按录入先后；无记录输出空列表，退出码 0。"
+        ),
+    )
+    adjustments.add_argument("--warehouse", required=True, help="仓库代码")
+    adjustments.add_argument("--product", required=True, help="商品代码")
+    adjustments.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -480,6 +544,78 @@ def _run_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_adjust(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    lot = args.batch.strip()
+    reason = args.reason.strip()
+
+    errors: list[str] = []
+    if not warehouse:
+        errors.append("仓库代码去首尾空白后不能为空")
+    if not product:
+        errors.append("商品代码去首尾空白后不能为空")
+    if not lot:
+        errors.append("批次号去首尾空白后不能为空")
+
+    delta = _parse_signed_int(args.delta)
+    if delta is None:
+        errors.append(f"调整量 {args.delta!r} 必须为带符号整数，如 -3 或 +2")
+    elif delta == 0:
+        errors.append("调整量不能为 0")
+
+    if not reason:
+        errors.append("调整原因去首尾空白后不能为空")
+
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    try:
+        with Ledger.open(db_path) as ledger:
+            resulting = ledger.adjust_stock(
+                warehouse, product, lot, delta, reason
+            )
+    except LedgerError as exc:
+        print(f"盘点调整失败：{exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"盘点调整成功：仓库={warehouse} 商品={product} 批次号={lot} "
+        f"调整量={delta} 调整后数量={resulting}"
+    )
+    return 0
+
+
+def _run_adjustments(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    if not db_path.exists():
+        records = []
+    else:
+        with Ledger.open(db_path) as ledger:
+            records = ledger.list_adjustments(warehouse, product)
+
+    print(f"仓库={warehouse} 商品={product} 调整记录总数={len(records)}")
+    for record in records:
+        print(
+            f"批次号={record.lot} 调整量={record.delta} "
+            f"调整后数量={record.resulting_quantity} "
+            f"原因={record.reason} 发生时间={record.occurred_at}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     if argv is None:
@@ -499,5 +635,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_receive(args)
     if args.command == "cancel":
         return _run_cancel(args)
+    if args.command == "adjust":
+        return _run_adjust(args)
+    if args.command == "adjustments":
+        return _run_adjustments(args)
     parser.print_help()
     return 0

@@ -5,9 +5,11 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_DB_FILENAME = "stock_ledger.db"
+ADJUSTMENT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Transfer order status literals; matched exactly, no case/spelling variants.
 STATUS_SHIPPED = "shipped"
@@ -43,6 +45,17 @@ class ShipLine:
     quantity: int
 
 
+@dataclass(frozen=True)
+class AdjustmentRecord:
+    """One persisted stock-count adjustment entry."""
+
+    lot: str
+    delta: int
+    resulting_quantity: int
+    reason: str
+    occurred_at: str  # YYYY-MM-DD HH:MM:SS
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_batches (
     id INTEGER PRIMARY KEY,
@@ -71,6 +84,16 @@ CREATE TABLE IF NOT EXISTS transfer_lines (
     shipped_quantity INTEGER NOT NULL CHECK (shipped_quantity > 0),
     received_quantity INTEGER,
     UNIQUE (transfer_no, lot)
+);
+CREATE TABLE IF NOT EXISTS stock_adjustments (
+    id INTEGER PRIMARY KEY,
+    warehouse TEXT NOT NULL,
+    product TEXT NOT NULL,
+    lot TEXT NOT NULL,
+    delta INTEGER NOT NULL CHECK (delta <> 0),
+    resulting_quantity INTEGER NOT NULL CHECK (resulting_quantity >= 0),
+    reason TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
 );
 """
 
@@ -135,6 +158,90 @@ class Ledger:
             (warehouse, product),
         )
         return [BatchRecord(*row) for row in rows]
+
+    def adjust_stock(
+        self,
+        warehouse: str,
+        product: str,
+        lot: str,
+        delta: int,
+        reason: str,
+    ) -> int:
+        """Apply one signed stock-count adjustment atomically.
+
+        The matched lot is located by exact (warehouse, product, lot) scope,
+        so same-named lots under other warehouses/products are never touched.
+        Its production/expiry dates never change. A missing lot, a zero
+        delta, or a result below zero raises LedgerError and leaves both the
+        stock and the adjustment history untouched. A result of exactly zero
+        removes the exhausted batch row (as shipment does). The adjustment is
+        recorded with its reason and timestamp before returning the new
+        on-hand quantity.
+        """
+        if delta == 0:
+            raise LedgerError("调整量不能为 0")
+        try:
+            with self._conn:
+                row = self._conn.execute(
+                    "SELECT quantity FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (warehouse, product, lot),
+                ).fetchone()
+                if row is None:
+                    raise LedgerError(
+                        f"批次 {lot} 在仓库 {warehouse} 商品 {product} 下不存在"
+                    )
+                resulting = row[0] + delta
+                if resulting < 0:
+                    raise LedgerError(
+                        f"批次 {lot} 调整后数量为 {resulting}，不能小于 0"
+                    )
+                if resulting == 0:
+                    self._conn.execute(
+                        "DELETE FROM stock_batches "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (warehouse, product, lot),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE stock_batches SET quantity = ? "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (resulting, warehouse, product, lot),
+                    )
+                occurred_at = datetime.now().strftime(ADJUSTMENT_TIME_FORMAT)
+                self._conn.execute(
+                    "INSERT INTO stock_adjustments "
+                    "(warehouse, product, lot, delta, resulting_quantity, "
+                    " reason, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        warehouse,
+                        product,
+                        lot,
+                        delta,
+                        resulting,
+                        reason,
+                        occurred_at,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerError(f"盘点调整失败：{exc}") from exc
+        return resulting
+
+    def list_adjustments(
+        self, warehouse: str, product: str
+    ) -> list[AdjustmentRecord]:
+        """Return adjustment history for warehouse+product, oldest first.
+
+        Entries sharing one timestamp stay in insertion order.
+        """
+        rows = self._conn.execute(
+            "SELECT lot, delta, resulting_quantity, reason, occurred_at "
+            "FROM stock_adjustments WHERE warehouse = ? AND product = ? "
+            "ORDER BY occurred_at, id",
+            (warehouse, product),
+        )
+        return [AdjustmentRecord(*row) for row in rows]
+
 
     def ship_transfer(
         self,

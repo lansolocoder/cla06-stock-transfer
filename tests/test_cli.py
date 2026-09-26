@@ -738,5 +738,212 @@ class CancelCommandTests(unittest.TestCase):
             self.assertEqual(self.order_state(cwd, "TR-1")[0], "shipped")
 
 
+class AdjustCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def register(self, cwd: Path, warehouse: str, product: str, *batches: str) -> None:
+        arguments = [
+            "register", "--warehouse", warehouse, "--product", product,
+        ]
+        for batch in batches:
+            arguments += ["--batch", batch]
+        result = self.invoke_in(cwd, *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_batch(self, cwd: Path, warehouse: str, product: str,
+                    lot: str) -> tuple[str, str, int] | None:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse, "--product", product
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(
+            rf"批次号={lot} 生产日期=(\S+) 有效期至=(\S+) 数量=(\d+)",
+            result.stdout,
+        )
+        if match is None:
+            return None
+        return match[1], match[2], int(match[3])
+
+    def adjust(self, cwd: Path, warehouse: str, product: str, lot: str,
+               delta: str, reason: str, db: str | None = None
+               ) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "adjust", "--warehouse", warehouse, "--product", product,
+            "--batch", lot, "--delta", delta, "--reason", reason,
+        ]
+        if db is not None:
+            arguments += ["--db", db]
+        return self.invoke_in(cwd, *arguments)
+
+    def test_adjust_modifies_one_batch_and_reports_decimal_integers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(
+                cwd, "WH-A", "SKU-1", "LOT-1,2024-03-01,2025-03-01,10"
+            )
+
+            result = self.adjust(cwd, "WH-A", "SKU-1", "LOT-1", "-3", "盘点破损")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                result.stdout.strip(),
+                "盘点调整成功：仓库=WH-A 商品=SKU-1 批次号=LOT-1 "
+                "调整量=-3 调整后数量=7",
+            )
+
+            # The signed-plus form is accepted; dates stay exactly as registered.
+            result = self.adjust(cwd, "WH-A", "SKU-1", "LOT-1", "+2", "盘盈")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整量=2 调整后数量=9", result.stdout)
+            self.assertEqual(
+                self.query_batch(cwd, "WH-A", "SKU-1", "LOT-1"),
+                ("2024-03-01", "2025-03-01", 9),
+            )
+
+    def test_adjust_is_scoped_to_warehouse_and_product(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1", "LOT-1,2024-01-01,2025-01-01,10")
+            self.register(cwd, "WH-A", "SKU-2", "LOT-1,2024-02-01,2025-02-01,20")
+            self.register(cwd, "WH-B", "SKU-1", "LOT-1,2024-03-01,2025-03-01,30")
+
+            self.assertEqual(
+                self.adjust(cwd, "WH-A", "SKU-1", "LOT-1", "-1", "x").returncode, 0
+            )
+            # Same lot, different product and different warehouse: untouched.
+            self.assertEqual(
+                self.query_batch(cwd, "WH-A", "SKU-2", "LOT-1"),
+                ("2024-02-01", "2025-02-01", 20),
+            )
+            self.assertEqual(
+                self.query_batch(cwd, "WH-B", "SKU-1", "LOT-1"),
+                ("2024-03-01", "2025-03-01", 30),
+            )
+
+            # No fuzzy matching: a lot missing in this exact scope is rejected.
+            result = self.adjust(cwd, "WH-B", "SKU-2", "LOT-1", "-1", "x")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_adjust_to_zero_removes_batch_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1", "LOT-1,2024-01-01,2025-01-01,3")
+            result = self.adjust(cwd, "WH-A", "SKU-1", "LOT-1", "-3", "清零")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整后数量=0", result.stdout)
+            self.assertIsNone(self.query_batch(cwd, "WH-A", "SKU-1", "LOT-1"))
+
+    def test_adjust_rejections_leave_ledger_and_history_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1", "LOT-1,2024-01-01,2025-01-01,5")
+
+            cases = [
+                (["--batch", "LOT-X", "--delta", "-1", "--reason", "x"], "不存在"),
+                (["--batch", "LOT-1", "--delta", "0", "--reason", "x"], "不能为 0"),
+                (["--batch", "LOT-1", "--delta", "abc", "--reason", "x"], "整数"),
+                (["--batch", "LOT-1", "--delta", "1.5", "--reason", "x"], "整数"),
+                (["--batch", "LOT-1", "--delta=-0", "--reason", "x"],
+                 "不能为 0"),
+                (["--batch", "LOT-1", "--delta", "-6", "--reason", "x"], "小于 0"),
+                (["--batch", "LOT-1", "--delta", "-1", "--reason", "   "],
+                 "不能为空"),
+            ]
+            for extra, hint in cases:
+                with self.subTest(extra=extra):
+                    result = self.invoke_in(
+                        cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1",
+                        *extra,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # Stock unchanged and no adjustment history written.
+            self.assertEqual(
+                self.query_batch(cwd, "WH-A", "SKU-1", "LOT-1"),
+                ("2024-01-01", "2025-01-01", 5),
+            )
+            result = self.invoke_in(
+                cwd, "adjustments", "--warehouse", "WH-A", "--product", "SKU-1"
+            )
+            self.assertIn("调整记录总数=0", result.stdout)
+
+    def test_adjustments_query_lists_history_chronologically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, "WH-A", "SKU-1", "LOT-1,2024-01-01,2025-01-01,10")
+            self.assertEqual(
+                self.adjust(cwd, "WH-A", "SKU-1", "LOT-1", "-2", "破损").returncode, 0
+            )
+            self.assertEqual(
+                self.adjust(cwd, "WH-A", "SKU-1", "LOT-1", "+1", "盘盈").returncode, 0
+            )
+
+            result = self.invoke_in(
+                cwd, "adjustments", "--warehouse", "WH-A", "--product", "SKU-1"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = [
+                line for line in result.stdout.splitlines() if line.startswith("批次号=")
+            ]
+            self.assertEqual(len(lines), 2)
+            self.assertRegex(lines[0], r"调整量=-2 调整后数量=8 原因=破损 发生时间=")
+            self.assertRegex(lines[1], r"调整量=1 调整后数量=9 原因=盘盈 发生时间=")
+            for line in lines:
+                self.assertRegex(
+                    line, r"发生时间=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
+                )
+            # Insertion order holds when timestamps coincide.
+            times = [line.rsplit("发生时间=", 1)[1] for line in lines]
+            if times[0] == times[1]:
+                self.assertIn("调整量=-2", lines[0])
+            self.assertLessEqual(times[0], times[1])
+
+    def test_adjustments_empty_list_and_missing_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = self.invoke_in(
+                cwd, "adjustments", "--warehouse", "WH-A", "--product", "SKU-1"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整记录总数=0", result.stdout)
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+    def test_adjustments_respects_custom_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "nested").mkdir()
+            db = str(cwd / "nested" / "ledger.db")
+            self.invoke_in(
+                cwd, "register", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1,2024-01-01,2025-01-01,5", "--db", db,
+            )
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--batch", "LOT-1", "--delta", "-2", "--reason", "破损",
+                "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "adjustments", "--warehouse", "WH-A", "--product", "SKU-1",
+                "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整记录总数=1", result.stdout)
+            self.assertIn("原因=破损", result.stdout)
+            self.assertFalse((cwd / "stock_ledger.db").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
