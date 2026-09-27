@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .ledger import (
     DEFAULT_DB_FILENAME,
+    AdjustmentRecord,
     BatchInput,
     Ledger,
     ReceiptItemInput,
@@ -255,6 +256,40 @@ def _validate_split_pieces(
     return parsed, errors
 
 
+def _validate_adjust_count(
+    raw: str,
+) -> tuple[tuple[str, int] | None, list[str]]:
+    """Validate the single ``批次号,盘点实存数量`` stock-taking line.
+
+    The counted quantity is a non-negative integer (zero means the lot
+    is physically gone). Returns the (lot, counted quantity) pair and
+    per-field errors; callers must reject the whole adjustment whenever
+    the error list is non-empty.
+    """
+    errors: list[str] = []
+    parts = [part.strip() for part in raw.split(",")]
+    if len(parts) != 2:
+        errors.append("盘点行格式错误，应为“批次号,盘点实存数量”")
+        return None, errors
+
+    lot, quantity_raw = parts
+    line_ok = True
+
+    if not lot:
+        errors.append("盘点行: 批次号不能为空")
+        line_ok = False
+
+    if not quantity_raw.isdigit():
+        errors.append(
+            f"盘点行: 盘点实存数量 {quantity_raw!r} 必须为非负整数"
+        )
+        line_ok = False
+
+    if not line_ok:
+        return None, errors
+    return (lot, int(quantity_raw)), errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
@@ -280,7 +315,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 -m stock_transfer merge --warehouse WH-A "
             "--product SKU-1001 \\\n"
             "      --lot LOT-2024-001A --lot LOT-2024-001B "
-            "--into LOT-2024-001"
+            "--into LOT-2024-001\n"
+            "  python3 -m stock_transfer adjust --warehouse WH-A "
+            "--product SKU-1001 \\\n"
+            "      --reason 月底盘点 --count LOT-2024-001,16\n"
+            "  python3 -m stock_transfer adjust-query --warehouse WH-A "
+            "--product SKU-1001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -437,6 +477,48 @@ def _build_parser() -> argparse.ArgumentParser:
         "--into", required=True, help="目标批次号（合并后保留的批次号）"
     )
     merge.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjust = subparsers.add_parser(
+        "adjust",
+        help="盘点调整：按盘点实存数量一次调入某批次的盘盈或盘亏并留存调整记录",
+        description=(
+            "整次一次落账；任一输入不合法则整次拒绝、台账与其它记录不变。"
+            "盘点行格式：批次号,盘点实存数量（非负整数，0 表示该批次实物已全部不在）。"
+            "批次号必须是该仓库该商品下已落账批次（含现存数量为 0 的批次）。"
+            "成功后该批次现存数量改为盘点实存数量，差额为正即盘盈、为负即盘亏，"
+            "并写入一条含调整原因、调整前后数量与差额的可查询调整记录。"
+        ),
+    )
+    adjust.add_argument("--warehouse", required=True, help="仓库代码")
+    adjust.add_argument("--product", required=True, help="商品代码")
+    adjust.add_argument(
+        "--reason",
+        required=True,
+        help="调整原因（去首尾空白后必须含非空白字符）",
+    )
+    adjust.add_argument(
+        "--count",
+        required=True,
+        metavar="批次号,盘点实存数量",
+        help="盘点行：批次号与盘点实存数量（非负整数）",
+    )
+    adjust.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    adjust_query = subparsers.add_parser(
+        "adjust-query",
+        help="按仓库与商品查询全部盘点调整记录（按登记先后顺序）",
+    )
+    adjust_query.add_argument("--warehouse", required=True, help="仓库代码")
+    adjust_query.add_argument("--product", required=True, help="商品代码")
+    adjust_query.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -824,6 +906,88 @@ def _run_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_adjust(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    reason = args.reason.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not reason:
+        print(
+            "调整原因去首尾空白后不能为空（必须含非空白字符）",
+            file=sys.stderr,
+        )
+        return 1
+
+    counted, errors = _validate_adjust_count(args.count)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+    assert counted is not None
+    lot, counted_quantity = counted
+
+    db_path = _db_path(args)
+    with Ledger.open(db_path) as ledger:
+        available = ledger.lot_quantities(warehouse, product, [lot]).get(lot)
+        if available is None:
+            print(
+                f"批次号 {lot} 未在仓库 {warehouse} 商品 {product} 下落账",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            record = ledger.adjust_batch(
+                warehouse, product, lot, counted_quantity, reason
+            )
+        except (TransferError, sqlite3.IntegrityError) as exc:
+            print(f"盘点调整失败：{exc}", file=sys.stderr)
+            return 1
+
+    print(
+        f"盘点调整成功：仓库={warehouse} 商品={product} "
+        f"批次号={record.lot} 调整前数量={record.before_quantity} "
+        f"调整后数量={record.after_quantity} 差额={record.delta} "
+        f"调整原因={record.reason}"
+    )
+    return 0
+
+
+def _print_adjustment(record: AdjustmentRecord) -> None:
+    print(
+        f"批次号={record.lot} 调整前数量={record.before_quantity} "
+        f"调整后数量={record.after_quantity} 差额={record.delta} "
+        f"调整原因={record.reason}"
+    )
+
+
+def _run_adjust_query(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    if not db_path.exists():
+        records = []
+    else:
+        with Ledger.open(db_path) as ledger:
+            records = ledger.list_adjustments(warehouse, product)
+
+    print(f"仓库={warehouse} 商品={product} 调整记录数={len(records)}")
+    for record in records:
+        _print_adjustment(record)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     if argv is None:
@@ -847,5 +1011,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_split(args)
     if args.command == "merge":
         return _run_merge(args)
+    if args.command == "adjust":
+        return _run_adjust(args)
+    if args.command == "adjust-query":
+        return _run_adjust_query(args)
     parser.print_help()
     return 0
