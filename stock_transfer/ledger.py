@@ -43,11 +43,20 @@ class TransferItemInput:
 
 
 @dataclass(frozen=True)
+class ReceivedItemInput:
+    """One ``批次号,实收数量`` receipt line on a receive command."""
+
+    lot: str
+    quantity: int
+
+
+@dataclass(frozen=True)
 class TransferItemRecord:
     """One persisted batch allocation row on a transfer order."""
 
     lot: str
     quantity: int
+    received_quantity: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,7 +108,9 @@ CREATE TABLE IF NOT EXISTS transfer_items (
     id INTEGER PRIMARY KEY,
     transfer_id INTEGER NOT NULL REFERENCES transfers(id),
     lot TEXT NOT NULL,
-    quantity INTEGER NOT NULL CHECK (quantity > 0)
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    received_quantity INTEGER NOT NULL DEFAULT 0
+        CHECK (received_quantity >= 0)
 );
 """
 
@@ -133,6 +144,22 @@ def _migrate_quantity_check(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE stock_batches_old")
 
 
+def _migrate_received_quantity_column(conn: sqlite3.Connection) -> None:
+    """Add per-lot received quantities to a transfer_items table lacking it."""
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(transfer_items)")
+    }
+    if not columns or "received_quantity" in columns:
+        return
+    with conn:
+        conn.execute(
+            "ALTER TABLE transfer_items "
+            "ADD COLUMN received_quantity INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (received_quantity >= 0)"
+        )
+
+
 class Ledger:
     """Thin data-access wrapper around a sqlite3 connection."""
 
@@ -145,6 +172,7 @@ class Ledger:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
         _migrate_quantity_check(conn)
+        _migrate_received_quantity_column(conn)
         return cls(conn)
 
     def close(self) -> None:
@@ -281,7 +309,7 @@ class Ledger:
             return None
         transfer_id, order_no, source, target, product, status, received = row
         item_rows = self._conn.execute(
-            "SELECT lot, quantity FROM transfer_items "
+            "SELECT lot, quantity, received_quantity FROM transfer_items "
             "WHERE transfer_id = ? ORDER BY id",
             (transfer_id,),
         )
@@ -289,3 +317,133 @@ class Ledger:
         return TransferRecord(
             order_no, source, target, product, status, received, items
         )
+
+    def receive_transfer(
+        self,
+        order_no: str,
+        received_items: Sequence[ReceivedItemInput],
+    ) -> int:
+        """Confirm receipt of one in-transit order and credit the target.
+
+        All lot receipts are applied in a single transaction: the target
+        warehouse is credited per lot (lots received with quantity 0
+        create no row; an existing same lot accumulates), batch
+        production/expiry dates are copied from the source warehouse
+        rows, each allocation line records its received quantity, and
+        the order becomes ``received`` with the received total.
+
+        Source-warehouse quantities are never touched. Raises
+        ``TransferError`` when the order is absent, not ``in_transit``,
+        the receipt lines do not cover exactly the order's lots, or a
+        received quantity exceeds the shipped quantity; in any such
+        case the whole transaction is rolled back.
+        """
+        with self._conn:
+            order_row = self._conn.execute(
+                "SELECT id, source_warehouse, target_warehouse, product, "
+                "status FROM transfers WHERE order_no = ?",
+                (order_no,),
+            ).fetchone()
+            if order_row is None:
+                raise TransferError(f"调拨单号 {order_no} 不存在")
+            transfer_id, source, target, product, status = order_row
+            if status != TRANSFER_IN_TRANSIT:
+                raise TransferError(
+                    f"调拨单号 {order_no} 当前状态为 {status}，"
+                    "只有在途单据可以收货确认"
+                )
+
+            item_rows = self._conn.execute(
+                "SELECT lot, quantity FROM transfer_items "
+                "WHERE transfer_id = ?",
+                (transfer_id,),
+            ).fetchall()
+            shipped: dict[str, int] = {lot: quantity for lot, quantity in item_rows}
+            receipts: dict[str, int] = {}
+            for item in received_items:
+                if item.lot in receipts:
+                    raise TransferError(
+                        f"批次号 {item.lot} 在同一次收货内重复"
+                    )
+                receipts[item.lot] = item.quantity
+
+            if set(receipts) != set(shipped):
+                missing = sorted(set(shipped) - set(receipts))
+                unknown = sorted(set(receipts) - set(shipped))
+                details = []
+                if missing:
+                    details.append("遗漏批次 " + "、".join(missing))
+                if unknown:
+                    details.append("单上不存在的批次 " + "、".join(unknown))
+                raise TransferError(
+                    "实收行必须逐一覆盖调拨单全部批次：" + "；".join(details)
+                )
+            for lot, quantity in receipts.items():
+                if quantity < 0:
+                    raise TransferError(
+                        f"批次号 {lot} 实收数量 {quantity} 不能为负数"
+                    )
+                if quantity > shipped[lot]:
+                    raise TransferError(
+                        f"批次号 {lot} 实收数量 {quantity} "
+                        f"大于调出数量 {shipped[lot]}"
+                    )
+
+            credited = [
+                (lot, quantity)
+                for lot, quantity in receipts.items()
+                if quantity > 0
+            ]
+            if credited:
+                placeholders = ",".join("?" for _ in credited)
+                date_rows = self._conn.execute(
+                    f"SELECT lot, production_date, expiry_date "
+                    f"FROM stock_batches "
+                    f"WHERE warehouse = ? AND product = ? "
+                    f"AND lot IN ({placeholders})",
+                    (source, product, *[lot for lot, _ in credited]),
+                ).fetchall()
+                dates = {
+                    lot: (production_date, expiry_date)
+                    for lot, production_date, expiry_date in date_rows
+                }
+                for lot, quantity in credited:
+                    lot_dates = dates.get(lot)
+                    if lot_dates is None:
+                        raise TransferError(
+                            f"批次号 {lot} 未在来源仓 {source} "
+                            f"商品 {product} 下落账"
+                        )
+                    production_date, expiry_date = lot_dates
+                    self._conn.execute(
+                        "INSERT INTO stock_batches "
+                        "(warehouse, product, lot, production_date, "
+                        "expiry_date, quantity) "
+                        "VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(warehouse, product, lot) DO UPDATE SET "
+                        "quantity = quantity + excluded.quantity",
+                        (
+                            target,
+                            product,
+                            lot,
+                            production_date,
+                            expiry_date,
+                            quantity,
+                        ),
+                    )
+
+            self._conn.executemany(
+                "UPDATE transfer_items SET received_quantity = ? "
+                "WHERE transfer_id = ? AND lot = ?",
+                [
+                    (quantity, transfer_id, lot)
+                    for lot, quantity in receipts.items()
+                ],
+            )
+            total_received = sum(receipts.values())
+            self._conn.execute(
+                "UPDATE transfers SET status = ?, received_quantity = ? "
+                "WHERE id = ?",
+                (TRANSFER_RECEIVED, total_received, transfer_id),
+            )
+            return total_received

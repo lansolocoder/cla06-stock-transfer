@@ -13,8 +13,10 @@ from pathlib import Path
 from . import __version__
 from .ledger import (
     DEFAULT_DB_FILENAME,
+    TRANSFER_IN_TRANSIT,
     BatchInput,
     Ledger,
+    ReceivedItemInput,
     TransferError,
     TransferItemInput,
     TransferRecord,
@@ -154,10 +156,63 @@ def _validate_transfer_items(
     return parsed, errors
 
 
+def _validate_received_items(
+    raw_lines: Sequence[str],
+) -> tuple[list[tuple[int, ReceivedItemInput]], list[str]]:
+    """Validate every ``批次号,实收数量`` receipt line.
+
+    Returns (line number, item) pairs and per-line errors; callers must
+    reject the whole receipt whenever the error list is non-empty.
+    A received quantity of 0 means the lot never arrived.
+    """
+    parsed: list[tuple[int, ReceivedItemInput]] = []
+    errors: list[str] = []
+    seen_lots: dict[str, int] = {}
+
+    for index, raw in enumerate(raw_lines, start=1):
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) != 2:
+            errors.append(
+                f"实收行 {index}: 实收行格式错误，应为"
+                "“批次号,实收数量”，每行只接受本行实收数量，不接受汇总数量"
+            )
+            continue
+
+        lot, quantity_raw = parts
+        line_ok = True
+
+        if not lot:
+            errors.append(f"实收行 {index}: 批次号不能为空")
+            line_ok = False
+
+        if not quantity_raw.isdigit():
+            errors.append(
+                f"实收行 {index}: 实收数量 {quantity_raw!r} 必须为非负整数"
+            )
+            line_ok = False
+
+        if not line_ok:
+            continue
+
+        item = ReceivedItemInput(lot, int(quantity_raw))
+        parsed.append((index, item))
+        first_line = seen_lots.get(lot)
+        if first_line is None:
+            seen_lots[lot] = index
+        else:
+            errors.append(
+                f"实收行 {index}: 批次号 {lot} 与实收行 {first_line} 重复"
+            )
+
+    return parsed, errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
-        description="Local 多仓库存台账：库存登记、批次查询与调拨在途跟踪。",
+        description=(
+            "Local 多仓库存台账：库存登记、批次查询、调拨在途跟踪与收货确认。"
+        ),
         epilog=(
             "示例：\n"
             "  python3 -m stock_transfer register --warehouse WH-A "
@@ -169,6 +224,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 -m stock_transfer transfer --order TR-001 \\\n"
             "      --from WH-A --to WH-B --product SKU-1001 \\\n"
             "      --item LOT-2024-001,10\n"
+            "  python3 -m stock_transfer receive --order TR-001 \\\n"
+            "      --received LOT-2024-001,10\n"
             "  python3 -m stock_transfer transfer-query --order TR-001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -245,6 +302,33 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     transfer_query.add_argument("--order", required=True, help="调拨单号")
     transfer_query.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    receive = subparsers.add_parser(
+        "receive",
+        help="收货确认：登记在途调拨单的实收情况并把商品记入目标仓",
+        description=(
+            "整次收货一次落账；任一实收行不合法则整单拒绝、各仓数量不变。"
+            "实收行格式：批次号,实收数量（非负整数，0 表示该批次未收到货），"
+            "必须逐一覆盖调拨单上的全部批次，不得遗漏或多出。"
+            "确认成功后单据状态为 received，实收数量为本次实收总数，"
+            "目标仓按批次入账实收数量。"
+        ),
+    )
+    receive.add_argument(
+        "--order", required=True, help="调拨单号（须为在途单据）"
+    )
+    receive.add_argument(
+        "--received",
+        required=True,
+        action="append",
+        metavar="批次号,实收数量",
+        help="实收行，可重复提供；须逐一覆盖调拨单上的全部批次",
+    )
+    receive.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -408,6 +492,70 @@ def _run_transfer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_receive(args: argparse.Namespace) -> int:
+    order_no = args.order.strip()
+    if not order_no:
+        print("调拨单号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    parsed, errors = _validate_received_items(args.received)
+    db_path = _db_path(args)
+
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    with Ledger.open(db_path) as ledger:
+        record = ledger.get_transfer(order_no)
+        if record is None:
+            errors.append(f"调拨单号 {order_no} 不存在")
+        elif record.status != TRANSFER_IN_TRANSIT:
+            errors.append(
+                f"调拨单号 {order_no} 当前状态为 {record.status}，"
+                "只有在途单据可以收货确认"
+            )
+        else:
+            shipped = {item.lot: item.quantity for item in record.items}
+            received_lots = {item.lot for _, item in parsed}
+            for lot in sorted(shipped.keys() - received_lots):
+                errors.append(
+                    f"批次号 {lot} 缺少对应实收行，"
+                    "实收行必须逐一覆盖调拨单全部批次"
+                )
+            for line_number, item in parsed:
+                if item.lot not in shipped:
+                    errors.append(
+                        f"实收行 {line_number}: 批次号 {item.lot} "
+                        f"不在调拨单 {order_no} 的批次分配行中"
+                    )
+                elif item.quantity > shipped[item.lot]:
+                    errors.append(
+                        f"实收行 {line_number}: 批次号 {item.lot} "
+                        f"实收数量 {item.quantity} "
+                        f"大于调出数量 {shipped[item.lot]}"
+                    )
+
+        if errors:
+            for message in errors:
+                print(message, file=sys.stderr)
+            return 1
+
+        try:
+            total = ledger.receive_transfer(
+                order_no, [item for _, item in parsed]
+            )
+        except TransferError as exc:
+            print(f"收货确认失败：{exc}", file=sys.stderr)
+            return 1
+
+    print(
+        f"收货确认成功：调拨单号={order_no} 状态=received "
+        f"实收数量={total} 批次数={len(parsed)}"
+    )
+    return 0
+
+
 def _print_transfer(record: TransferRecord) -> None:
     print(
         f"调拨单号={record.order_no} 来源仓={record.source_warehouse} "
@@ -416,7 +564,10 @@ def _print_transfer(record: TransferRecord) -> None:
         f"批次数={len(record.items)}"
     )
     for item in record.items:
-        print(f"批次号={item.lot} 调出数量={item.quantity}")
+        print(
+            f"批次号={item.lot} 调出数量={item.quantity} "
+            f"实收数量={item.received_quantity}"
+        )
 
 
 def _run_transfer_query(args: argparse.Namespace) -> int:
@@ -456,6 +607,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_query(args)
     if args.command == "transfer":
         return _run_transfer(args)
+    if args.command == "receive":
+        return _run_receive(args)
     if args.command == "transfer-query":
         return _run_transfer_query(args)
     parser.print_help()
