@@ -297,6 +297,110 @@ class Ledger:
                         f"超过现存数量 {row[0]}"
                     )
 
+    def split_batch(
+        self,
+        warehouse: str,
+        product: str,
+        source_lot: str,
+        new_batches: Sequence[tuple[str, int]],
+    ) -> None:
+        """Replace one batch row with new lot rows, conserving quantity.
+
+        The new rows inherit the source row's production/expiry dates.
+        Everything happens in one transaction; raises ``TransferError``
+        when the source lot is missing or the split quantities do not
+        add up to its on-hand quantity, and ``sqlite3.IntegrityError``
+        when a new lot collides with an existing batch.
+        """
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT production_date, expiry_date, quantity "
+                "FROM stock_batches "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                (warehouse, product, source_lot),
+            ).fetchone()
+            if row is None:
+                raise TransferError(
+                    f"批次号 {source_lot} 未在仓库 {warehouse} "
+                    f"商品 {product} 下落账"
+                )
+            production_date, expiry_date, quantity = row
+            total = sum(qty for _, qty in new_batches)
+            if total != quantity:
+                raise TransferError(
+                    f"拆分数量之和 {total} 必须等于来源批次 {source_lot} "
+                    f"现存数量 {quantity}"
+                )
+            self._conn.execute(
+                "DELETE FROM stock_batches "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                (warehouse, product, source_lot),
+            )
+            self._conn.executemany(
+                "INSERT INTO stock_batches "
+                "(warehouse, product, lot, production_date, expiry_date, "
+                "quantity) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (warehouse, product, lot, production_date, expiry_date, qty)
+                    for lot, qty in new_batches
+                ],
+            )
+
+    def merge_batches(
+        self,
+        warehouse: str,
+        product: str,
+        source_lots: Sequence[str],
+        target_lot: str,
+    ) -> tuple[str, str, int]:
+        """Merge existing batch rows into one target lot, conserving quantity.
+
+        The merged row takes the earliest production date and the latest
+        expiry date among the sources. Returns the merged row's
+        (production_date, expiry_date, quantity). Everything happens in
+        one transaction; raises ``TransferError`` when a source lot is
+        missing or holds no positive quantity, and
+        ``sqlite3.IntegrityError`` when the target lot collides with an
+        existing batch.
+        """
+        with self._conn:
+            placeholders = ",".join("?" for _ in source_lots)
+            rows = self._conn.execute(
+                f"SELECT lot, production_date, expiry_date, quantity "
+                f"FROM stock_batches "
+                f"WHERE warehouse = ? AND product = ? "
+                f"AND lot IN ({placeholders})",
+                (warehouse, product, *source_lots),
+            ).fetchall()
+            found = {lot: (prod, exp, qty) for lot, prod, exp, qty in rows}
+            for lot in source_lots:
+                if lot not in found:
+                    raise TransferError(
+                        f"批次号 {lot} 未在仓库 {warehouse} "
+                        f"商品 {product} 下落账"
+                    )
+                if found[lot][2] <= 0:
+                    raise TransferError(
+                        f"批次号 {lot} 现存数量为 0，不得参与合并"
+                    )
+            production_date = min(found[lot][0] for lot in source_lots)
+            expiry_date = max(found[lot][1] for lot in source_lots)
+            total = sum(found[lot][2] for lot in source_lots)
+            self._conn.execute(
+                f"DELETE FROM stock_batches "
+                f"WHERE warehouse = ? AND product = ? "
+                f"AND lot IN ({placeholders})",
+                (warehouse, product, *source_lots),
+            )
+            self._conn.execute(
+                "INSERT INTO stock_batches "
+                "(warehouse, product, lot, production_date, expiry_date, "
+                "quantity) VALUES (?, ?, ?, ?, ?, ?)",
+                (warehouse, product, target_lot, production_date,
+                 expiry_date, total),
+            )
+        return production_date, expiry_date, total
+
     def get_transfer(self, order_no: str) -> TransferRecord | None:
         """Return the order and its allocation lines, or None if absent."""
         row = self._conn.execute(

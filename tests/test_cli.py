@@ -703,5 +703,257 @@ class ReceiveCommandTests(unittest.TestCase):
         self.assertIn("receive", result.stdout)
 
 
+class SplitMergeCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed(self, cwd: Path, db: str) -> None:
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            "--batch", "LOT-2,2024-04-02,2025-06-02,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_warehouse(self, cwd: Path, db: str, warehouse: str) -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse,
+            "--product", "SKU-1001", "--db", db,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_split_success_replaces_source_and_conserves_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+
+            result = self.invoke_in(
+                cwd,
+                "split", "--warehouse", " WH-A ", "--product", "SKU-1001",
+                "--lot", " LOT-1 ", "--db", db,
+                "--into", " LOT-A , 10 ", "--into", "LOT-B,8",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("拆分成功", result.stdout)
+            self.assertIn("来源批次号=LOT-1", result.stdout)
+            self.assertIn("总数量=18", result.stdout)
+
+            # Read back in a new process: source gone, two new lots with
+            # the source batch's dates.
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次总数=3", output)
+            self.assertNotIn("LOT-1 ", output)
+            self.assertIn("批次号=LOT-A 生产日期=2024-03-01 有效期至=2025-03-01 数量=10", output)
+            self.assertIn("批次号=LOT-B 生产日期=2024-03-01 有效期至=2025-03-01 数量=8", output)
+            self.assertIn("批次号=LOT-2", output)
+
+    def test_split_rejections_leave_ledger_unchanged(self) -> None:
+        cases = [
+            (["--lot", "LOT-1", "--into", "LOT-A,10"], "恰好"),
+            (["--lot", "LOT-1", "--into", "LOT-A,6", "--into", "LOT-B,6",
+              "--into", "LOT-C,6"], "恰好"),
+            (["--lot", "LOT-1", "--into", "LOT-A,10", "--into", "LOT-B,9"],
+             "现存数量 18"),
+            (["--lot", "LOT-X", "--into", "LOT-A,10", "--into", "LOT-B,8"],
+             "LOT-X"),
+            (["--lot", "LOT-1", "--into", "LOT-1,10", "--into", "LOT-B,8"],
+             "不得与来源批次号相同"),
+            (["--lot", "LOT-1", "--into", "LOT-A,10", "--into", "LOT-A,8"],
+             "重复"),
+            (["--lot", "LOT-1", "--into", "LOT-2,10", "--into", "LOT-B,8"],
+             "已在仓库"),
+            (["--lot", "LOT-1", "--into", "LOT-A,0", "--into", "LOT-B,18"],
+             "正整数"),
+            (["--lot", "LOT-1", "--into", "LOT-A,x", "--into", "LOT-B,18"],
+             "正整数"),
+            (["--lot", "LOT-1", "--into", "LOT-A", "--into", "LOT-B,18"],
+             "格式"),
+            (["--lot", "LOT-1", "--into", " ,10", "--into", "LOT-B,8"],
+             "新批次号不能为空"),
+            (["--lot", "  ", "--into", "LOT-A,10", "--into", "LOT-B,8"],
+             "来源批次号"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            for extra, hint in cases:
+                with self.subTest(hint=hint):
+                    result = self.invoke_in(
+                        cwd, "split", "--warehouse", "WH-A",
+                        "--product", "SKU-1001", "--db", db, *extra,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次总数=2", output)
+            self.assertIn("数量=18", output)
+            self.assertIn("数量=12", output)
+
+    def test_merge_success_combines_quantities_and_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+
+            result = self.invoke_in(
+                cwd,
+                "merge", "--warehouse", "WH-A", "--product", " SKU-1001 ",
+                "--lot", " LOT-1 ", "--lot", "LOT-2", "--into", "LOT-M",
+                "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("合并成功", result.stdout)
+            self.assertIn("目标批次号=LOT-M", result.stdout)
+            self.assertIn("数量=30", result.stdout)
+
+            # Earlier production date, later expiry date; sources gone.
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次总数=1", output)
+            self.assertIn("批次号=LOT-M 生产日期=2024-03-01 有效期至=2025-06-02 数量=30", output)
+            self.assertNotIn("LOT-1", output)
+            self.assertNotIn("LOT-2", output)
+
+    def test_merge_rejections_leave_ledger_unchanged(self) -> None:
+        cases = [
+            (["--lot", "LOT-1", "--into", "LOT-M"], "恰好"),
+            (["--lot", "LOT-1", "--lot", "LOT-1", "--into", "LOT-M"],
+             "必须不同"),
+            (["--lot", "LOT-1", "--lot", "LOT-2", "--into", "LOT-1"],
+             "不得与任一来源批次号相同"),
+            (["--lot", "LOT-1", "--lot", "LOT-X", "--into", "LOT-M"],
+             "LOT-X"),
+            (["--lot", "LOT-1", "--lot", "LOT-2", "--into", "  "],
+             "目标批次号"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            for extra, hint in cases:
+                with self.subTest(hint=hint):
+                    result = self.invoke_in(
+                        cwd, "merge", "--warehouse", "WH-A",
+                        "--product", "SKU-1001", "--db", db, *extra,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # A zero-quantity source lot cannot be merged.
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-1", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,18",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "merge", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+                "--lot", "LOT-1", "--lot", "LOT-2", "--into", "LOT-M",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("现存数量为 0", result.stderr)
+
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次总数=2", output)
+            self.assertIn("数量=0", output)
+            self.assertIn("数量=12", output)
+
+    def test_merge_target_must_not_already_be_booked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            result = self.invoke_in(
+                cwd,
+                "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--batch", "LOT-3,2024-01-01,2025-01-01,5",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "merge", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+                "--lot", "LOT-1", "--lot", "LOT-2", "--into", "LOT-3",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("LOT-3", result.stderr)
+            self.assertIn("已在仓库", result.stderr)
+
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次总数=3", output)
+
+    def test_split_and_merge_do_not_touch_transfer_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-1", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-2,4",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "split", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+                "--lot", "LOT-1", "--into", "LOT-A,10", "--into", "LOT-B,8",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "merge", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+                "--lot", "LOT-A", "--lot", "LOT-B", "--into", "LOT-M",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            # Transfer order and its per-lot records are untouched.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-1", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=in_transit", result.stdout)
+            self.assertIn("批次号=LOT-2 调出数量=4 实收数量=0", result.stdout)
+
+            # Receipt against the original order still works afterwards.
+            result = self.invoke_in(
+                cwd, "receive", "--order", "TR-1", "--db", db,
+                "--received", "LOT-2,4",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次号=LOT-2", target)
+            self.assertIn("数量=4", target)
+
+    def test_help_mentions_split_and_merge(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("split", result.stdout)
+        self.assertIn("merge", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
