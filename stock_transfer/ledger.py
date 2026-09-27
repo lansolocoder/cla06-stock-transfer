@@ -51,6 +51,14 @@ class ReceiptItemInput:
 
 
 @dataclass(frozen=True)
+class SplitPieceInput:
+    """One ``新批次号,数量`` split line produced by a split command."""
+
+    lot: str
+    quantity: int
+
+
+@dataclass(frozen=True)
 class TransferItemRecord:
     """One persisted batch allocation row on a transfer order."""
 
@@ -450,3 +458,136 @@ class Ledger:
         record = self.get_transfer(order_no)
         assert record is not None
         return record
+
+    def split_batch(
+        self,
+        warehouse: str,
+        product: str,
+        source_lot: str,
+        pieces: Sequence[SplitPieceInput],
+    ) -> None:
+        """Replace one booked batch with new lots in a single transaction.
+
+        The source row is removed and each piece becomes its own batch
+        row inheriting the source production/expiry dates; the piece
+        quantities must sum exactly to the source on-hand quantity.
+        Raises ``TransferError`` on a missing source lot, a quantity
+        mismatch, or a new lot number already booked; the whole
+        transaction rolls back on any violation.
+        """
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT production_date, expiry_date, quantity "
+                "FROM stock_batches "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                (warehouse, product, source_lot),
+            ).fetchone()
+            if row is None:
+                raise TransferError(
+                    f"批次号 {source_lot} 未在仓库 {warehouse} "
+                    f"商品 {product} 下落账"
+                )
+            production_date, expiry_date, quantity = row
+            total = sum(piece.quantity for piece in pieces)
+            if total != quantity:
+                raise TransferError(
+                    f"拆分数量之和 {total} 必须等于来源批次 {source_lot} "
+                    f"现存数量 {quantity}"
+                )
+            conflicts = self.existing_lots(
+                warehouse, product, [piece.lot for piece in pieces]
+            )
+            if conflicts:
+                raise TransferError(
+                    "新批次号 " + "、".join(sorted(conflicts))
+                    + f" 已在仓库 {warehouse} 商品 {product} 下落账"
+                )
+            self._conn.execute(
+                "DELETE FROM stock_batches "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                (warehouse, product, source_lot),
+            )
+            self._conn.executemany(
+                "INSERT INTO stock_batches "
+                "(warehouse, product, lot, production_date, expiry_date, "
+                "quantity) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        warehouse,
+                        product,
+                        piece.lot,
+                        production_date,
+                        expiry_date,
+                        piece.quantity,
+                    )
+                    for piece in pieces
+                ],
+            )
+
+    def merge_batches(
+        self,
+        warehouse: str,
+        product: str,
+        source_lots: Sequence[str],
+        target_lot: str,
+    ) -> None:
+        """Merge two booked batches into one target lot atomically.
+
+        Both source rows are removed and the target lot is booked with
+        the summed quantity, the earlier production date and the later
+        expiry date of the two sources. Raises ``TransferError`` when a
+        source lot is missing or holds no positive quantity, when the
+        target equals a source, or when the target lot is already
+        booked; the whole transaction rolls back on any violation.
+        """
+        first, second = source_lots
+        with self._conn:
+            records: dict[str, tuple[str, str, int]] = {}
+            for lot in (first, second):
+                row = self._conn.execute(
+                    "SELECT production_date, expiry_date, quantity "
+                    "FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (warehouse, product, lot),
+                ).fetchone()
+                if row is None:
+                    raise TransferError(
+                        f"批次号 {lot} 未在仓库 {warehouse} "
+                        f"商品 {product} 下落账"
+                    )
+                records[lot] = (row[0], row[1], row[2])
+            for lot in (first, second):
+                if records[lot][2] <= 0:
+                    raise TransferError(
+                        f"批次号 {lot} 现存数量为 0，不得参与合并"
+                    )
+            if target_lot in (first, second):
+                raise TransferError(
+                    f"目标批次号 {target_lot} 不得等于任一来源批次号"
+                )
+            if self.existing_lots(warehouse, product, [target_lot]):
+                raise TransferError(
+                    f"目标批次号 {target_lot} 已在仓库 {warehouse} "
+                    f"商品 {product} 下落账"
+                )
+            production_date = min(records[first][0], records[second][0])
+            expiry_date = max(records[first][1], records[second][1])
+            quantity = records[first][2] + records[second][2]
+            self._conn.executemany(
+                "DELETE FROM stock_batches "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                [(warehouse, product, lot) for lot in (first, second)],
+            )
+            self._conn.execute(
+                "INSERT INTO stock_batches "
+                "(warehouse, product, lot, production_date, expiry_date, "
+                "quantity) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    warehouse,
+                    product,
+                    target_lot,
+                    production_date,
+                    expiry_date,
+                    quantity,
+                ),
+            )

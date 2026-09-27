@@ -16,6 +16,7 @@ from .ledger import (
     BatchInput,
     Ledger,
     ReceiptItemInput,
+    SplitPieceInput,
     TransferError,
     TransferItemInput,
     TransferRecord,
@@ -205,6 +206,55 @@ def _validate_receipt_items(
     return parsed, errors
 
 
+def _validate_split_pieces(
+    raw_lines: Sequence[str],
+) -> tuple[list[tuple[int, SplitPieceInput]], list[str]]:
+    """Validate every ``新批次号,数量`` split line.
+
+    Returns (line number, piece) pairs and per-line errors; callers must
+    reject the whole split whenever the error list is non-empty.
+    """
+    parsed: list[tuple[int, SplitPieceInput]] = []
+    errors: list[str] = []
+    seen_lots: dict[str, int] = {}
+
+    for index, raw in enumerate(raw_lines, start=1):
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) != 2:
+            errors.append(
+                f"拆分行 {index}: 拆分行格式错误，应为“新批次号,数量”"
+            )
+            continue
+
+        lot, quantity_raw = parts
+        line_ok = True
+
+        if not lot:
+            errors.append(f"拆分行 {index}: 新批次号不能为空")
+            line_ok = False
+
+        if not quantity_raw.isdigit() or int(quantity_raw) <= 0:
+            errors.append(
+                f"拆分行 {index}: 数量 {quantity_raw!r} 必须为正整数"
+            )
+            line_ok = False
+
+        if not line_ok:
+            continue
+
+        piece = SplitPieceInput(lot, int(quantity_raw))
+        parsed.append((index, piece))
+        first_line = seen_lots.get(lot)
+        if first_line is None:
+            seen_lots[lot] = index
+        else:
+            errors.append(
+                f"拆分行 {index}: 新批次号 {lot} 与拆分行 {first_line} 重复"
+            )
+
+    return parsed, errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stock-transfer",
@@ -222,7 +272,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "      --item LOT-2024-001,10\n"
             "  python3 -m stock_transfer transfer-query --order TR-001\n"
             "  python3 -m stock_transfer receive --order TR-001 \\\n"
-            "      --received LOT-2024-001,9 --received LOT-2024-002,4"
+            "      --received LOT-2024-001,9 --received LOT-2024-002,4\n"
+            "  python3 -m stock_transfer split --warehouse WH-A "
+            "--product SKU-1001 \\\n"
+            "      --lot LOT-2024-001 \\\n"
+            "      --into LOT-2024-001A,10 --into LOT-2024-001B,8\n"
+            "  python3 -m stock_transfer merge --warehouse WH-A "
+            "--product SKU-1001 \\\n"
+            "      --lot LOT-2024-001A --lot LOT-2024-001B "
+            "--into LOT-2024-001"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -322,6 +380,63 @@ def _build_parser() -> argparse.ArgumentParser:
         help="实收行，可重复提供，须逐一覆盖该单全部批次且不得重复",
     )
     receive.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    split = subparsers.add_parser(
+        "split",
+        help="把一个既有批次按数量拆成两个新批次号（同仓库同商品，数量守恒）",
+        description=(
+            "整次一次落账；任一输入不合法则全部拒绝、台账不变。"
+            "拆分行格式：新批次号,数量（正整数），必须恰好两行，"
+            "两行数量之和必须等于来源批次现存数量，不允许留有余数。"
+            "拆分后来源批次行不再保留，两个新批次各按本行数量成为独立批次行，"
+            "生产日期与有效期至均沿用来源批次的日期。"
+        ),
+    )
+    split.add_argument("--warehouse", required=True, help="仓库代码")
+    split.add_argument("--product", required=True, help="商品代码")
+    split.add_argument(
+        "--lot", required=True, help="来源批次号（拆分后不再保留）"
+    )
+    split.add_argument(
+        "--into",
+        required=True,
+        action="append",
+        metavar="新批次号,数量",
+        help="拆分行，必须恰好提供两行，新批次号互不相同且不得与来源批次号相同",
+    )
+    split.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    merge = subparsers.add_parser(
+        "merge",
+        help="把两个既有批次合并为一个目标批次号（同仓库同商品，数量守恒）",
+        description=(
+            "整次一次落账；任一输入不合法则全部拒绝、台账不变。"
+            "两个来源批次号必须不同且都已落账、数量均为正整数；"
+            "目标批次号不得等于任一来源批次号，也不得与已落账批次冲突。"
+            "合并后两个来源批次行不再保留，目标批次数量为两者之和，"
+            "生产日期取两者中较早的日期，有效期至取两者中较晚的日期。"
+        ),
+    )
+    merge.add_argument("--warehouse", required=True, help="仓库代码")
+    merge.add_argument("--product", required=True, help="商品代码")
+    merge.add_argument(
+        "--lot",
+        required=True,
+        action="append",
+        help="来源批次号，必须恰好提供两个且互不相同",
+    )
+    merge.add_argument(
+        "--into", required=True, help="目标批次号（合并后保留的批次号）"
+    )
+    merge.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -554,6 +669,161 @@ def _run_receive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_split(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    source_lot = args.lot.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not source_lot:
+        print("来源批次号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    parsed, errors = _validate_split_pieces(args.into)
+    if len(args.into) != 2:
+        errors.append(
+            f"拆分行必须恰好两行（新批次号,数量），实际收到 {len(args.into)} 行"
+        )
+    for _, piece in parsed:
+        if piece.lot == source_lot:
+            errors.append(
+                f"新批次号 {piece.lot} 不得与来源批次号 {source_lot} 相同"
+            )
+
+    db_path = _db_path(args)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    with Ledger.open(db_path) as ledger:
+        quantities = ledger.lot_quantities(warehouse, product, [source_lot])
+        available = quantities.get(source_lot)
+        if available is None:
+            errors.append(
+                f"来源批次号 {source_lot} 未在仓库 {warehouse} "
+                f"商品 {product} 下落账"
+            )
+        else:
+            total = sum(piece.quantity for _, piece in parsed)
+            if total != available:
+                errors.append(
+                    f"两行拆分行数量之和 {total} 必须等于来源批次 "
+                    f"{source_lot} 现存数量 {available}"
+                )
+        conflicts = ledger.existing_lots(
+            warehouse, product, [piece.lot for _, piece in parsed]
+        )
+        for line_number, piece in parsed:
+            if piece.lot in conflicts:
+                errors.append(
+                    f"拆分行 {line_number}: 新批次号 {piece.lot} "
+                    f"已在仓库 {warehouse} 商品 {product} 下落账"
+                )
+
+        if errors:
+            for message in errors:
+                print(message, file=sys.stderr)
+            return 1
+
+        try:
+            ledger.split_batch(
+                warehouse, product, source_lot,
+                [piece for _, piece in parsed],
+            )
+        except (TransferError, sqlite3.IntegrityError) as exc:
+            print(f"拆分失败：{exc}", file=sys.stderr)
+            return 1
+
+    total = sum(piece.quantity for _, piece in parsed)
+    new_lots = "、".join(piece.lot for _, piece in parsed)
+    print(
+        f"拆分成功：仓库={warehouse} 商品={product} "
+        f"来源批次号={source_lot} 新批次号={new_lots} "
+        f"总数量={total} 批次数={len(parsed)}"
+    )
+    return 0
+
+
+def _run_merge(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    source_lots = [lot.strip() for lot in args.lot]
+    target_lot = args.into.strip()
+    errors: list[str] = []
+    if len(source_lots) != 2:
+        errors.append(
+            f"来源批次号必须恰好两个，实际收到 {len(source_lots)} 个"
+        )
+    for lot in source_lots:
+        if not lot:
+            errors.append("来源批次号去首尾空白后不能为空")
+    if not target_lot:
+        errors.append("目标批次号去首尾空白后不能为空")
+    first, second = (source_lots + [None, None])[:2]
+    if first and second and first == second:
+        errors.append(f"两个来源批次号必须不同，均为 {first}")
+    if target_lot and target_lot in source_lots:
+        errors.append(f"目标批次号 {target_lot} 不得等于任一来源批次号")
+
+    db_path = _db_path(args)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        return 1
+
+    with Ledger.open(db_path) as ledger:
+        quantities = ledger.lot_quantities(warehouse, product, source_lots)
+        for lot in source_lots:
+            available = quantities.get(lot)
+            if available is None:
+                errors.append(
+                    f"来源批次号 {lot} 未在仓库 {warehouse} "
+                    f"商品 {product} 下落账"
+                )
+            elif available <= 0:
+                errors.append(
+                    f"来源批次号 {lot} 现存数量为 0，不得参与合并"
+                )
+        if target_lot in ledger.existing_lots(
+            warehouse, product, [target_lot]
+        ):
+            errors.append(
+                f"目标批次号 {target_lot} 已在仓库 {warehouse} "
+                f"商品 {product} 下落账"
+            )
+
+        if errors:
+            for message in errors:
+                print(message, file=sys.stderr)
+            return 1
+
+        try:
+            ledger.merge_batches(warehouse, product, source_lots, target_lot)
+        except (TransferError, sqlite3.IntegrityError) as exc:
+            print(f"合并失败：{exc}", file=sys.stderr)
+            return 1
+
+    total = sum(quantities[lot] for lot in source_lots)
+    print(
+        f"合并成功：仓库={warehouse} 商品={product} "
+        f"来源批次号={source_lots[0]}、{source_lots[1]} "
+        f"目标批次号={target_lot} 数量={total}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     if argv is None:
@@ -573,5 +843,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_transfer_query(args)
     if args.command == "receive":
         return _run_receive(args)
+    if args.command == "split":
+        return _run_split(args)
+    if args.command == "merge":
+        return _run_merge(args)
     parser.print_help()
     return 0
