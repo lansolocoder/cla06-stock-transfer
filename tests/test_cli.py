@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -475,6 +476,231 @@ class TransferCommandTests(unittest.TestCase):
                 cwd, "transfer-query", "--order", "TR-006", "--db", db
             )
             self.assertIn("批次数=0", result.stdout)
+
+
+class ReceiveCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed_in_transit(self, cwd: Path, db: str) -> None:
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            "--batch", "LOT-2,2024-04-02,2025-04-02,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.invoke_in(
+            cwd,
+            "transfer", "--order", "TR-001", "--from", "WH-A",
+            "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+            "--item", "LOT-1,10", "--item", "LOT-2,4",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_warehouse(self, cwd: Path, db: str, warehouse: str) -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse,
+            "--product", "SKU-1001", "--db", db,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_receive_with_discrepancy_credits_target_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+
+            result = self.invoke_in(
+                cwd, "receive", "--order", " TR-001 ", "--db", db,
+                "--received", " LOT-1 , 9 ", "--received", "LOT-2,0",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=received", result.stdout)
+            self.assertIn("实收数量=9", result.stdout)
+
+            # Per-batch received quantities read back in a new process.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=received", result.stdout)
+            self.assertIn("实收数量=9", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=10 实收数量=9", result.stdout)
+            self.assertIn("批次号=LOT-2 调出数量=4 实收数量=0", result.stdout)
+
+            # Target gets 9 for LOT-1 with source registration dates, and
+            # the zero-received LOT-2 creates no batch row.
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次总数=1", target)
+            self.assertIn("批次号=LOT-1", target)
+            self.assertIn("生产日期=2024-03-01", target)
+            self.assertIn("有效期至=2025-03-01", target)
+            self.assertIn("数量=9", target)
+            self.assertNotIn("LOT-2", target)
+
+            # Source draw-down from the transfer is untouched.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=8", source)
+
+    def test_target_lot_accumulates_when_already_booked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            # Target already holds 3 of LOT-1.
+            result = self.invoke_in(
+                cwd,
+                "register", "--warehouse", "WH-B", "--product", "SKU-1001",
+                "--db", db, "--batch", "LOT-1,2024-01-01,2025-01-01,3",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,10", "--received", "LOT-2,4",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次总数=2", target)
+            self.assertIn("批次号=LOT-1", target)
+            self.assertIn("数量=13", target)
+            self.assertIn("批次号=LOT-2", target)
+            self.assertIn("数量=4", target)
+
+    def test_full_receipt_marks_received_with_total(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            result = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,10", "--received", "LOT-2,4",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=received", result.stdout)
+            self.assertIn("实收数量=14", result.stdout)
+
+    def test_duplicate_confirmation_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            first = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,9", "--received", "LOT-2,0",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            # A late, different receipt must not overwrite the first.
+            result = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,10", "--received", "LOT-2,4",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("received", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("数量=9", target)
+            self.assertNotIn("LOT-2", target)
+
+    def test_rejection_cases_leave_everything_unchanged(self) -> None:
+        cases = [
+            (["--received", "LOT-1,10"], "缺少"),
+            (["--received", "LOT-1,10", "--received", "LOT-2,4",
+              "--received", "LOT-X,1"], "不存在的批次号"),
+            (["--received", "LOT-1,11", "--received", "LOT-2,4"], "超过调出数量"),
+            (["--received", "LOT-1,-1", "--received", "LOT-2,4"], "非负整数"),
+            (["--received", "LOT-1,x", "--received", "LOT-2,4"], "非负整数"),
+            (["--received", "LOT-1,10", "--received", "LOT-1,0",
+              "--received", "LOT-2,4"], "重复"),
+            (["--received", "LOT-1"], "格式"),
+            (["--received", "  ,1"], "批次号不能为空"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            for extra, hint in cases:
+                with self.subTest(hint=hint):
+                    result = self.invoke_in(
+                        cwd, "receive", "--order", "TR-001", "--db", db,
+                        *extra,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            # Order still in transit with zero received, target untouched.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertIn("状态=in_transit", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次总数=0", target)
+
+    def test_unknown_order_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            result = self.invoke_in(
+                cwd, "receive", "--order", "NOPE", "--db", db,
+                "--received", "LOT-1,1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("NOPE", result.stderr)
+            self.assertIn("不存在", result.stderr)
+
+    def test_cancelled_order_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "UPDATE transfers SET status='cancelled' "
+                    "WHERE order_no='TR-001'"
+                )
+            result = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,10", "--received", "LOT-2,4",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cancelled", result.stderr)
+            self.assertIn("批次总数=0", self.query_warehouse(cwd, db, "WH-B"))
+
+    def test_blank_order_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            result = self.invoke_in(
+                cwd, "receive", "--order", "   ", "--db", db,
+                "--received", "LOT-1,1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("调拨单号", result.stderr)
+
+    def test_help_mentions_receive(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("receive", result.stdout)
 
 
 if __name__ == "__main__":
