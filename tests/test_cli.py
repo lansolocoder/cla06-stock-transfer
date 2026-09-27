@@ -964,5 +964,249 @@ class SplitMergeCommandTests(unittest.TestCase):
         self.assertIn("merge", result.stdout)
 
 
+class AdjustCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed(self, cwd: Path, db: str) -> None:
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            "--batch", "LOT-2,2024-04-02,2025-04-02,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_warehouse(self, cwd: Path, db: str, warehouse: str) -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse,
+            "--product", "SKU-1001", "--db", db,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_adjust_surplus_and_shortage_booked_and_queryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+
+            # Surplus (盘盈): counted more than booked.
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", " WH-A ", "--product", "SKU-1001",
+                "--db", db, "--reason", " 月底盘点 ", "--count", " LOT-1 , 20 ",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("盘点调整成功", result.stdout)
+            self.assertIn("仓库=WH-A", result.stdout)
+            self.assertIn("商品=SKU-1001", result.stdout)
+            self.assertIn("批次号=LOT-1", result.stdout)
+            self.assertIn("调整前数量=18", result.stdout)
+            self.assertIn("调整后数量=20", result.stdout)
+            self.assertIn("差额=2", result.stdout)
+            self.assertIn("调整原因=月底盘点", result.stdout)
+
+            # Shortage (盘亏) down to zero on another lot.
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--reason", "破损报废", "--count", "LOT-2,0",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整前数量=12", result.stdout)
+            self.assertIn("调整后数量=0", result.stdout)
+            self.assertIn("差额=-12", result.stdout)
+
+            # Quantities read back in a new process; dates unchanged.
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn(
+                "批次号=LOT-1 生产日期=2024-03-01 有效期至=2025-03-01 数量=20",
+                output,
+            )
+            self.assertIn(
+                "批次号=LOT-2 生产日期=2024-04-02 有效期至=2025-04-02 数量=0",
+                output,
+            )
+
+            # Adjustment records read back in registration order.
+            result = self.invoke_in(
+                cwd, "adjust-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整记录数=2", result.stdout)
+            first = result.stdout.index("批次号=LOT-1")
+            second = result.stdout.index("批次号=LOT-2")
+            self.assertLess(first, second)
+            self.assertIn(
+                "批次号=LOT-1 调整前数量=18 调整后数量=20 差额=2 "
+                "调整原因=月底盘点",
+                result.stdout,
+            )
+            self.assertIn(
+                "批次号=LOT-2 调整前数量=12 调整后数量=0 差额=-12 "
+                "调整原因=破损报废",
+                result.stdout,
+            )
+
+    def test_adjust_query_empty_returns_zero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = self.invoke_in(
+                cwd, "adjust-query", "--warehouse", "WH-X",
+                "--product", "SKU-X", "--db", str(cwd / "ledger.db"),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整记录数=0", result.stdout)
+            self.assertFalse((cwd / "ledger.db").exists())
+
+    def test_adjust_rejections_leave_ledger_unchanged(self) -> None:
+        cases = [
+            (["--warehouse", "  ", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", "LOT-1,18"], "仓库代码"),
+            (["--warehouse", "WH-A", "--product", "  ",
+              "--reason", "盘点", "--count", "LOT-1,18"], "商品代码"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "   ", "--count", "LOT-1,18"], "调整原因"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", " ,18"], "批次号不能为空"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", "LOT-1"], "格式"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", "LOT-1,1,2"], "格式"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", "LOT-1,-1"], "非负整数"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", "LOT-1,x"], "非负整数"),
+            (["--warehouse", "WH-A", "--product", "SKU-1001",
+              "--reason", "盘点", "--count", "LOT-X,5"], "落账"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            for extra, hint in cases:
+                with self.subTest(hint=hint):
+                    result = self.invoke_in(cwd, "adjust", "--db", db, *extra)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(hint, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=18", output)
+            self.assertIn("数量=12", output)
+            result = self.invoke_in(
+                cwd, "adjust-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+            )
+            self.assertIn("调整记录数=0", result.stdout)
+
+    def test_adjust_zero_quantity_lot_is_adjustable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            # Draw LOT-2 down to zero via a transfer, then adjust it back up.
+            result = self.invoke_in(
+                cwd, "transfer", "--order", "TR-1", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-2,12",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--reason", "找回实物", "--count", "LOT-2,3",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整前数量=0", result.stdout)
+            self.assertIn("调整后数量=3", result.stdout)
+            self.assertIn("差额=3", result.stdout)
+
+    def test_adjust_does_not_touch_transfers_or_other_lots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            result = self.invoke_in(
+                cwd, "transfer", "--order", "TR-1", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,10",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--reason", "盘点", "--count", "LOT-1,6",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            # Transfer order and its lines are untouched.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-1", "--db", db
+            )
+            self.assertIn("状态=in_transit", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=10 实收数量=0", result.stdout)
+
+            # Other lots unchanged; only LOT-1 adjusted (18 - 10 -> 6).
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次号=LOT-1", output)
+            self.assertIn("数量=6", output)
+            self.assertIn("数量=12", output)
+
+    def test_split_merge_do_not_touch_adjustment_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--reason", "盘点", "--count", "LOT-1,20",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "split", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--lot", "LOT-1",
+                "--into", "LOT-1A,10", "--into", "LOT-1B,10",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.invoke_in(
+                cwd, "merge", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--lot", "LOT-1A", "--lot", "LOT-1B",
+                "--into", "LOT-M",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "adjust-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调整记录数=1", result.stdout)
+            self.assertIn(
+                "批次号=LOT-1 调整前数量=18 调整后数量=20 差额=2 调整原因=盘点",
+                result.stdout,
+            )
+
+    def test_help_mentions_adjust(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("adjust", result.stdout)
+        self.assertIn("adjust-query", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,17 @@ class SplitPieceInput:
 
 
 @dataclass(frozen=True)
+class AdjustmentRecord:
+    """One persisted stock-taking adjustment row."""
+
+    lot: str
+    reason: str
+    before_quantity: int
+    after_quantity: int
+    delta: int
+
+
+@dataclass(frozen=True)
 class TransferItemRecord:
     """One persisted batch allocation row on a transfer order."""
 
@@ -122,8 +133,26 @@ CREATE TABLE IF NOT EXISTS transfer_items (
 );
 """
 
+_ADJUSTMENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS stock_adjustments (
+    id INTEGER PRIMARY KEY,
+    warehouse TEXT NOT NULL,
+    product TEXT NOT NULL,
+    lot TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    before_quantity INTEGER NOT NULL,
+    after_quantity INTEGER NOT NULL CHECK (after_quantity >= 0),
+    delta INTEGER NOT NULL
+);
+"""
+
 _SCHEMA = "\n".join(
-    [_BATCHES_TABLE, _TRANSFERS_TABLE, _TRANSFER_ITEMS_TABLE]
+    [
+        _BATCHES_TABLE,
+        _TRANSFERS_TABLE,
+        _TRANSFER_ITEMS_TABLE,
+        _ADJUSTMENTS_TABLE,
+    ]
 )
 
 
@@ -591,3 +620,68 @@ class Ledger:
                     quantity,
                 ),
             )
+
+    def adjust_batch(
+        self,
+        warehouse: str,
+        product: str,
+        lot: str,
+        counted_quantity: int,
+        reason: str,
+    ) -> AdjustmentRecord:
+        """Book one stock-taking adjustment in a single transaction.
+
+        The lot's on-hand quantity is set to the counted physical
+        quantity (zero allowed, meaning the lot is physically gone);
+        the difference is positive for a surplus （盘盈） and negative
+        for a shortage （盘亏）. One adjustment row recording the reason
+        and the before/after quantities is written alongside. Raises
+        ``TransferError`` when the lot is not booked under this
+        warehouse and product; the whole transaction rolls back on any
+        violation. Transfer orders and their lines are never touched.
+        """
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT quantity FROM stock_batches "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                (warehouse, product, lot),
+            ).fetchone()
+            if row is None:
+                raise TransferError(
+                    f"批次号 {lot} 未在仓库 {warehouse} "
+                    f"商品 {product} 下落账"
+                )
+            before = row[0]
+            delta = counted_quantity - before
+            self._conn.execute(
+                "UPDATE stock_batches SET quantity = ? "
+                "WHERE warehouse = ? AND product = ? AND lot = ?",
+                (counted_quantity, warehouse, product, lot),
+            )
+            self._conn.execute(
+                "INSERT INTO stock_adjustments "
+                "(warehouse, product, lot, reason, before_quantity, "
+                "after_quantity, delta) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    warehouse,
+                    product,
+                    lot,
+                    reason,
+                    before,
+                    counted_quantity,
+                    delta,
+                ),
+            )
+        return AdjustmentRecord(lot, reason, before, counted_quantity, delta)
+
+    def list_adjustments(
+        self, warehouse: str, product: str
+    ) -> list[AdjustmentRecord]:
+        """Return all adjustment rows for warehouse+product, oldest first."""
+        rows = self._conn.execute(
+            "SELECT lot, reason, before_quantity, after_quantity, delta "
+            "FROM stock_adjustments WHERE warehouse = ? AND product = ? "
+            "ORDER BY id",
+            (warehouse, product),
+        )
+        return [AdjustmentRecord(*row) for row in rows]
