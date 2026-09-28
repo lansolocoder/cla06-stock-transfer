@@ -703,6 +703,240 @@ class ReceiveCommandTests(unittest.TestCase):
         self.assertIn("receive", result.stdout)
 
 
+class CancelCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed_in_transit(self, cwd: Path, db: str) -> None:
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            "--batch", "LOT-2,2024-04-02,2025-04-02,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.invoke_in(
+            cwd,
+            "transfer", "--order", "TR-001", "--from", "WH-A",
+            "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+            "--item", "LOT-1,10", "--item", "LOT-2,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_warehouse(self, cwd: Path, db: str, warehouse: str) -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse,
+            "--product", "SKU-1001", "--db", db,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_cancel_returns_quantities_and_persists_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", " TR-001 ", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单取消成功", result.stdout)
+            self.assertIn("调拨单号=TR-001", result.stdout)
+            self.assertIn("来源仓=WH-A", result.stdout)
+            self.assertIn("目标仓=WH-B", result.stdout)
+            self.assertIn("状态=cancelled", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            self.assertIn("批次数=2", result.stdout)
+
+            # transfer-query in a new process reads every field back.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=cancelled", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            self.assertIn("商品=SKU-1001", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=10 实收数量=0", result.stdout)
+            self.assertIn("批次号=LOT-2 调出数量=12 实收数量=0", result.stdout)
+
+            # Source lots are fully credited back, dates unchanged.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn(
+                "批次号=LOT-1 生产日期=2024-03-01 有效期至=2025-03-01 数量=18",
+                source,
+            )
+            self.assertIn(
+                "批次号=LOT-2 生产日期=2024-04-02 有效期至=2025-04-02 数量=12",
+                source,
+            )
+            # Target never gains anything.
+            self.assertIn("批次总数=0", self.query_warehouse(cwd, db, "WH-B"))
+
+    def test_rejection_cases_leave_everything_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+
+            blank = self.invoke_in(cwd, "cancel", "--order", "   ", "--db", db)
+            self.assertNotEqual(blank.returncode, 0)
+            self.assertIn("调拨单号", blank.stderr)
+            self.assertEqual(blank.stdout, "")
+
+            missing = self.invoke_in(cwd, "cancel", "--order", "NOPE", "--db", db)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("NOPE", missing.stderr)
+            self.assertIn("不存在", missing.stderr)
+            self.assertEqual(missing.stdout, "")
+
+            first = self.invoke_in(cwd, "cancel", "--order", "TR-001", "--db", db)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second = self.invoke_in(cwd, "cancel", "--order", "TR-001", "--db", db)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("cancelled", second.stderr)
+            self.assertEqual(second.stdout, "")
+
+            # Credited exactly once: still 18/12 after the repeat rejection.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=18", source)
+            self.assertIn("数量=12", source)
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertIn("状态=cancelled", result.stdout)
+
+    def test_received_order_cannot_be_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            received = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,9", "--received", "LOT-2,0",
+            )
+            self.assertEqual(received.returncode, 0, received.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("received", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            # Nothing moved: source draw-down kept, target receipt kept.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=8", source)
+            self.assertIn("数量=0", source)
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次总数=1", target)
+            self.assertIn("数量=9", target)
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertIn("状态=received", result.stdout)
+            self.assertIn("实收数量=9", result.stdout)
+
+    def test_cancel_returns_to_recorded_lot_after_split_removed_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            # Seed only LOT-1 (18); transfer 10 leaves 8 in transit.
+            self.invoke_in(
+                cwd,
+                "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db,
+                "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            )
+            self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-001", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,10",
+            )
+            # Split deletes the LOT-1 row entirely; descendants must not
+            # receive the returned quantity.
+            split = self.invoke_in(
+                cwd, "split", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--lot", "LOT-1",
+                "--into", "LOT-1A,5", "--into", "LOT-1B,3",
+            )
+            self.assertEqual(split.returncode, 0, split.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            output = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次总数=3", output)
+            # The recorded lot number itself comes back with transfer-time
+            # dates and the full transferred quantity.
+            self.assertIn(
+                "批次号=LOT-1 生产日期=2024-03-01 有效期至=2025-03-01 数量=10",
+                output,
+            )
+            self.assertIn("批次号=LOT-1A", output)
+            self.assertIn("数量=5", output)
+            self.assertIn("批次号=LOT-1B", output)
+            self.assertIn("数量=3", output)
+            self.assertIn("批次总数=0", self.query_warehouse(cwd, db, "WH-B"))
+
+    def test_concurrent_cancels_have_at_most_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+
+            outputs = []
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-m", "stock_transfer",
+                     "cancel", "--order", "TR-001", "--db", db],
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=ENV,
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                stdout, stderr = process.communicate()
+                outputs.append((process.returncode, stdout, stderr))
+
+            successes = [out for out in outputs if out[0] == 0]
+            self.assertEqual(len(successes), 1, outputs)
+            loser = next(out for out in outputs if out[0] != 0)
+            self.assertIn("cancelled", loser[2])
+
+            # Quantities credited exactly once.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=18", source)
+            self.assertIn("数量=12", source)
+            self.assertIn("批次总数=0", self.query_warehouse(cwd, db, "WH-B"))
+
+    def test_help_mentions_cancel(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("cancel", result.stdout)
+
+
 class SplitMergeCommandTests(unittest.TestCase):
     def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
