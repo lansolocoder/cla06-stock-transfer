@@ -91,6 +91,47 @@ class AdjustmentRecord:
     delta: int
 
 
+# Reconciliation (调拨对账) difference statuses; the mapping is a fixed
+# public contract of the ledger.
+RECONCILE_SETTLED = "已结清"
+RECONCILE_RECEIPT_DIFFERENCE = "收货差异未结清"
+RECONCILE_RETURNED = "已退回结清"
+RECONCILE_UNSETTLED = "未结清"
+
+
+@dataclass(frozen=True)
+class ReconciliationRecord:
+    """One transfer order summarized for warehouse+product reconciliation.
+
+    ``shipped_quantity`` is the sum of the order's per-allocation shipped
+    quantities; ``received_total`` is the order's recorded received total.
+    ``difference_status`` is derived from the order status per the fixed
+    reconciliation contract.
+    """
+
+    order_no: str
+    source_warehouse: str
+    target_warehouse: str
+    product: str
+    status: str
+    shipped_quantity: int
+    received_total: int
+    difference_status: str
+
+
+def reconciliation_difference_status(
+    status: str, received_total: int, shipped_quantity: int
+) -> str:
+    """Derive the fixed difference status for one transfer order."""
+    if status == TRANSFER_RECEIVED:
+        if received_total == shipped_quantity:
+            return RECONCILE_SETTLED
+        return RECONCILE_RECEIPT_DIFFERENCE
+    if status == TRANSFER_CANCELLED:
+        return RECONCILE_RETURNED
+    return RECONCILE_UNSETTLED
+
+
 class TransferError(Exception):
     """Raised when a transfer submission violates a ledger rule."""
 
@@ -405,6 +446,55 @@ class Ledger:
         return TransferRecord(
             order_no, source, target, product, status, received, items
         )
+
+    def list_transfers_for_reconciliation(
+        self, warehouse: str, product: str
+    ) -> list[ReconciliationRecord]:
+        """Return every order touching *warehouse* for *product*, oldest first.
+
+        An order is in scope when its source or target warehouse equals
+        *warehouse* and its product equals *product*; an order whose source
+        and target are both *warehouse* still appears only once. Results are
+        ordered by registration order (transfer ``id``). Read-only: no
+        ledger row is modified.
+        """
+        rows = self._conn.execute(
+            "SELECT t.order_no, t.source_warehouse, t.target_warehouse, "
+            "t.product, t.status, t.received_quantity, "
+            "COALESCE(SUM(ti.quantity), 0) AS shipped_quantity "
+            "FROM transfers AS t "
+            "LEFT JOIN transfer_items AS ti ON ti.transfer_id = t.id "
+            "WHERE (t.source_warehouse = ? OR t.target_warehouse = ?) "
+            "AND t.product = ? "
+            "GROUP BY t.id "
+            "ORDER BY t.id",
+            (warehouse, warehouse, product),
+        )
+        records: list[ReconciliationRecord] = []
+        for (
+            order_no,
+            source,
+            target,
+            product_code,
+            status,
+            received_total,
+            shipped_quantity,
+        ) in rows:
+            records.append(
+                ReconciliationRecord(
+                    order_no,
+                    source,
+                    target,
+                    product_code,
+                    status,
+                    shipped_quantity,
+                    received_total,
+                    reconciliation_difference_status(
+                        status, received_total, shipped_quantity
+                    ),
+                )
+            )
+        return records
 
     def confirm_receipt(
         self,
