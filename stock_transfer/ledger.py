@@ -129,7 +129,9 @@ CREATE TABLE IF NOT EXISTS transfer_items (
     lot TEXT NOT NULL,
     quantity INTEGER NOT NULL CHECK (quantity > 0),
     received_quantity INTEGER NOT NULL DEFAULT 0
-        CHECK (received_quantity >= 0)
+        CHECK (received_quantity >= 0),
+    production_date TEXT,
+    expiry_date TEXT
 );
 """
 
@@ -197,6 +199,32 @@ def _migrate_transfer_items_received(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_transfer_items_dates(conn: sqlite3.Connection) -> None:
+    """Add the remembered batch-date columns to an old transfer_items.
+
+    Cancellation refunds each allocation line back to its own lot number;
+    a split/merge may since have removed that lot from the source warehouse,
+    so its production/expiry dates are captured on the line at transfer
+    creation. Pre-existing lines (all either ``in_transit`` or already
+    settled) simply stay NULL.
+    """
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(transfer_items)").fetchall()
+    }
+    if not columns:
+        return
+    with conn:
+        if "production_date" not in columns:
+            conn.execute(
+                "ALTER TABLE transfer_items ADD COLUMN production_date TEXT"
+            )
+        if "expiry_date" not in columns:
+            conn.execute(
+                "ALTER TABLE transfer_items ADD COLUMN expiry_date TEXT"
+            )
+
+
 class Ledger:
     """Thin data-access wrapper around a sqlite3 connection."""
 
@@ -210,6 +238,7 @@ class Ledger:
         conn.executescript(_SCHEMA)
         _migrate_quantity_check(conn)
         _migrate_transfer_items_received(conn)
+        _migrate_transfer_items_dates(conn)
         return cls(conn)
 
     def close(self) -> None:
@@ -306,10 +335,32 @@ class Ledger:
                 (order_no, source, target, product, TRANSFER_IN_TRANSIT),
             )
             transfer_id = cursor.lastrowid
+            item_lots = [item.lot for item in items]
+            placeholders = ",".join("?" for _ in item_lots)
+            date_rows = self._conn.execute(
+                f"SELECT lot, production_date, expiry_date FROM stock_batches "
+                f"WHERE warehouse = ? AND product = ? "
+                f"AND lot IN ({placeholders})",
+                (source, product, *item_lots),
+            )
+            lot_dates = {
+                lot: (production_date, expiry_date)
+                for lot, production_date, expiry_date in date_rows
+            }
             self._conn.executemany(
-                "INSERT INTO transfer_items (transfer_id, lot, quantity) "
-                "VALUES (?, ?, ?)",
-                [(transfer_id, item.lot, item.quantity) for item in items],
+                "INSERT INTO transfer_items "
+                "(transfer_id, lot, quantity, production_date, expiry_date) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        transfer_id,
+                        item.lot,
+                        item.quantity,
+                        lot_dates.get(item.lot, (None, None))[0],
+                        lot_dates.get(item.lot, (None, None))[1],
+                    )
+                    for item in items
+                ],
             )
             for item in items:
                 cursor = self._conn.execute(
@@ -478,11 +529,115 @@ class Ledger:
                 ],
             )
             total = sum(received.values())
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE transfers SET status = ?, received_quantity = ? "
-                "WHERE id = ?",
-                (TRANSFER_RECEIVED, total, transfer_id),
+                "WHERE id = ? AND status = ?",
+                (TRANSFER_RECEIVED, total, transfer_id, TRANSFER_IN_TRANSIT),
             )
+            if cursor.rowcount != 1:
+                # A concurrent cancellation won the in_transit transition.
+                raise TransferError(
+                    f"调拨单号 {order_no} 已不在 in_transit 状态，收货确认失败"
+                )
+
+        record = self.get_transfer(order_no)
+        assert record is not None
+        return record
+
+    def cancel_transfer(self, order_no: str) -> TransferRecord:
+        """Cancel one in-transit order and refund its source lots atomically.
+
+        Only an ``in_transit`` order may be cancelled. Every allocation
+        line is refunded in full to that same lot in the source warehouse:
+        an existing lot accumulates the transferred quantity, while a lot
+        since removed by a split/merge is re-created with the dates
+        remembered on the line (split/merge descendants are never
+        followed). The target warehouse books nothing, per-line quantities
+        and received quantities stay unchanged, and the received total
+        stays 0 while the status flips to ``cancelled``.
+
+        The whole operation runs under ``BEGIN IMMEDIATE`` and the status
+        flip is conditional on ``status = 'in_transit'``, so two
+        concurrent cancellations of the same order can commit at most
+        once; the loser rolls back whole and raises ``TransferError``.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT id, source_warehouse, target_warehouse, product, status "
+                "FROM transfers WHERE order_no = ?",
+                (order_no,),
+            ).fetchone()
+            if row is None:
+                raise TransferError(f"调拨单号 {order_no} 不存在")
+            transfer_id, source, target, product, status = row
+            if status == TRANSFER_RECEIVED:
+                raise TransferError(
+                    f"调拨单号 {order_no} 已是 received 状态，不得取消"
+                )
+            if status == TRANSFER_CANCELLED:
+                raise TransferError(
+                    f"调拨单号 {order_no} 已是 cancelled 状态，不得重复取消"
+                )
+
+            cursor = conn.execute(
+                "UPDATE transfers SET status = ? "
+                "WHERE id = ? AND status = ?",
+                (TRANSFER_CANCELLED, transfer_id, TRANSFER_IN_TRANSIT),
+            )
+            if cursor.rowcount != 1:
+                # Lost a concurrent race with another status transition;
+                # never refund twice.
+                raise TransferError(
+                    f"调拨单号 {order_no} 已不在 in_transit 状态，取消失败"
+                )
+
+            item_rows = conn.execute(
+                "SELECT lot, quantity, production_date, expiry_date "
+                "FROM transfer_items WHERE transfer_id = ? ORDER BY id",
+                (transfer_id,),
+            ).fetchall()
+            for lot, quantity, production_date, expiry_date in item_rows:
+                existing = conn.execute(
+                    "SELECT production_date, expiry_date FROM stock_batches "
+                    "WHERE warehouse = ? AND product = ? AND lot = ?",
+                    (source, product, lot),
+                ).fetchone()
+                if existing is not None:
+                    # Refund the recorded lot itself; dates stay as booked.
+                    conn.execute(
+                        "UPDATE stock_batches SET quantity = quantity + ? "
+                        "WHERE warehouse = ? AND product = ? AND lot = ?",
+                        (quantity, source, product, lot),
+                    )
+                else:
+                    # The lot was removed from the source by a later
+                    # split/merge: refund only this recorded lot number,
+                    # never its split/merge descendants.
+                    if production_date is None or expiry_date is None:
+                        raise TransferError(
+                            f"批次号 {lot} 缺少登记日期，无法退回来源仓 "
+                            f"{source} 商品 {product}"
+                        )
+                    conn.execute(
+                        "INSERT INTO stock_batches "
+                        "(warehouse, product, lot, production_date, "
+                        "expiry_date, quantity) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            source,
+                            product,
+                            lot,
+                            production_date,
+                            expiry_date,
+                            quantity,
+                        ),
+                    )
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
 
         record = self.get_transfer(order_no)
         assert record is not None

@@ -703,6 +703,331 @@ class ReceiveCommandTests(unittest.TestCase):
         self.assertIn("receive", result.stdout)
 
 
+class CancelCommandTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed_in_transit(self, cwd: Path, db: str) -> None:
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-1,2024-03-01,2025-03-01,18",
+            "--batch", "LOT-2,2024-04-02,2025-04-02,12",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.invoke_in(
+            cwd,
+            "transfer", "--order", "TR-001", "--from", "WH-A",
+            "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+            "--item", "LOT-1,10", "--item", "LOT-2,4",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def query_warehouse(self, cwd: Path, db: str, warehouse: str) -> str:
+        result = self.invoke_in(
+            cwd, "query", "--warehouse", warehouse,
+            "--product", "SKU-1001", "--db", db,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_cancel_refunds_source_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+
+            # Source is drawn down before cancellation.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=8", source)  # LOT-1: 18 - 10
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", " TR-001 ", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("取消成功", result.stdout)
+            self.assertIn("调拨单号=TR-001", result.stdout)
+            self.assertIn("状态=cancelled", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            self.assertEqual(result.stderr, "")
+
+            # Every allocation line refunded in full, dates unchanged;
+            # read back from a fresh process.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn(
+                "批次号=LOT-1 生产日期=2024-03-01 有效期至=2025-03-01 数量=18",
+                source,
+            )
+            self.assertIn(
+                "批次号=LOT-2 生产日期=2024-04-02 有效期至=2025-04-02 数量=12",
+                source,
+            )
+
+            # Target books nothing.
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次总数=0", target)
+
+            # Status and all order fields read back, line records untouched.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("状态=cancelled", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=10 实收数量=0", result.stdout)
+            self.assertIn("批次号=LOT-2 调出数量=4 实收数量=0", result.stdout)
+
+    def test_cancel_refunds_existing_lot_by_accumulation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            # The remaining LOT-1 balance (8) is adjusted away; cancelling
+            # must add back onto the still-booked lot, not replace it.
+            result = self.invoke_in(
+                cwd, "adjust", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--reason", "盘亏", "--count", "LOT-1,5",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("批次号=LOT-1", source)
+            self.assertIn("数量=15", source)  # 5 remaining + 10 refunded
+            self.assertIn("数量=12", source)  # 8 remaining + 4 refunded
+
+    def test_cancel_after_split_refunds_recorded_lot_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            # LOT-1 stands at 8 after the transfer; split it away so the
+            # recorded lot LOT-1 no longer exists in the source warehouse.
+            result = self.invoke_in(
+                cwd, "split", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--lot", "LOT-1",
+                "--into", "LOT-1A,5", "--into", "LOT-1B,3",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            source = self.query_warehouse(cwd, db, "WH-A")
+            # Only the recorded lot number is refunded (re-created with the
+            # dates captured at transfer time); split descendants untouched.
+            self.assertIn(
+                "批次号=LOT-1 生产日期=2024-03-01 有效期至=2025-03-01 数量=10",
+                source,
+            )
+            self.assertIn("批次号=LOT-1A 生产日期=2024-03-01 有效期至=2025-03-01 数量=5", source)
+            self.assertIn("批次号=LOT-1B 生产日期=2024-03-01 有效期至=2025-03-01 数量=3", source)
+            self.assertIn("数量=12", source)  # LOT-2: 8 remaining + 4 refunded
+
+            # Transfer records themselves stay as booked.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertIn("状态=cancelled", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=10 实收数量=0", result.stdout)
+
+    def test_cancel_after_merge_refunds_recorded_lot_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            # Merge the remaining LOT-1 balance (8) with LOT-2 (8): both
+            # recorded allocation lots disappear from the warehouse.
+            result = self.invoke_in(
+                cwd, "merge", "--warehouse", "WH-A", "--product", "SKU-1001",
+                "--db", db, "--lot", "LOT-1", "--lot", "LOT-2",
+                "--into", "LOT-M",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            source = self.query_warehouse(cwd, db, "WH-A")
+            # Both recorded lots come back with their own dates; the merge
+            # result LOT-M is never touched.
+            self.assertIn(
+                "批次号=LOT-1 生产日期=2024-03-01 有效期至=2025-03-01 数量=10",
+                source,
+            )
+            self.assertIn(
+                "批次号=LOT-2 生产日期=2024-04-02 有效期至=2025-04-02 数量=4",
+                source,
+            )
+            self.assertIn(
+                "批次号=LOT-M 生产日期=2024-03-01 有效期至=2025-04-02 数量=16",
+                source,
+            )
+
+    def test_received_order_cannot_be_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            received = self.invoke_in(
+                cwd, "receive", "--order", "TR-001", "--db", db,
+                "--received", "LOT-1,9", "--received", "LOT-2,4",
+            )
+            self.assertEqual(received.returncode, 0, received.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TR-001", result.stderr)
+            self.assertIn("received", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            # Ledger is the post-receipt state, nothing refunded.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertIn("状态=received", result.stdout)
+            self.assertIn("实收数量=13", result.stdout)
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=8", source)
+            self.assertIn("数量=8", source)
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("数量=9", target)
+            self.assertIn("数量=4", target)
+
+    def test_duplicate_cancel_rejected_without_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            first = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            # The same request repeated must not refund a second time.
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cancelled", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=18", source)
+            self.assertIn("数量=12", source)
+
+    def test_cancel_unknown_and_blank_order_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "NOPE", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("NOPE", result.stderr)
+            self.assertIn("不存在", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "   ", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("调拨单号", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_cancel_does_not_touch_other_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+            result = self.invoke_in(
+                cwd,
+                "transfer", "--order", "TR-002", "--from", "WH-A",
+                "--to", "WH-C", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,3",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = self.invoke_in(
+                cwd, "cancel", "--order", "TR-001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            # TR-002 stays in transit and its draw-down is untouched.
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-002", "--db", db
+            )
+            self.assertIn("状态=in_transit", result.stdout)
+            self.assertIn("批次号=LOT-1 调出数量=3 实收数量=0", result.stdout)
+            source = self.query_warehouse(cwd, db, "WH-A")
+            # 18 - 10 (TR-001) - 3 (TR-002) + 10 (TR-001 refund) = 15
+            self.assertIn("数量=15", source)
+
+    def test_concurrent_cancels_commit_at_most_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed_in_transit(cwd, db)
+
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-m", "stock_transfer", "cancel",
+                     "--order", "TR-001", "--db", db],
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=ENV,
+                )
+                for _ in range(20)
+            ]
+            codes = [process.wait() for process in processes]
+            for process in processes:
+                process.stdout.close()
+                process.stderr.close()
+            self.assertEqual(codes.count(0), 1, codes)
+
+            # Refund happened exactly once and the order is cancelled.
+            source = self.query_warehouse(cwd, db, "WH-A")
+            self.assertIn("数量=18", source)
+            self.assertIn("数量=12", source)
+            result = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-001", "--db", db
+            )
+            self.assertIn("状态=cancelled", result.stdout)
+            self.assertIn("实收数量=0", result.stdout)
+            target = self.query_warehouse(cwd, db, "WH-B")
+            self.assertIn("批次总数=0", target)
+
+    def test_help_mentions_cancel(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("cancel", result.stdout)
+
+
 class SplitMergeCommandTests(unittest.TestCase):
     def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

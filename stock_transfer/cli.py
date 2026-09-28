@@ -308,6 +308,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python3 -m stock_transfer transfer-query --order TR-001\n"
             "  python3 -m stock_transfer receive --order TR-001 \\\n"
             "      --received LOT-2024-001,9 --received LOT-2024-002,4\n"
+            "  python3 -m stock_transfer cancel --order TR-001\n"
             "  python3 -m stock_transfer split --warehouse WH-A "
             "--product SKU-1001 \\\n"
             "      --lot LOT-2024-001 \\\n"
@@ -420,6 +421,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="实收行，可重复提供，须逐一覆盖该单全部批次且不得重复",
     )
     receive.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    cancel = subparsers.add_parser(
+        "cancel",
+        help="取消在途调拨单：退回来源仓调出数量并推进到 cancelled",
+        description=(
+            "整单一次落账；仅对 in_transit 状态的调拨单登记取消。"
+            "成功后该单各分配行批次按调出数量全额退回来源仓对应批次现存数量"
+            "（之后经拆分、合并消失的批次只按分配行记录的批次号本身退回，"
+            "不找回拆分、合并产生的新批次号），目标仓不产生任何数量或批次行，"
+            "实收数量保持 0，各批次调出与实收数量记录不变，状态变为 cancelled。"
+            "调拨单号不存在、单据已是 received 或 cancelled 均拒绝且台账不变。"
+        ),
+    )
+    cancel.add_argument("--order", required=True, help="调拨单号")
+    cancel.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -751,6 +771,30 @@ def _run_receive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_cancel(args: argparse.Namespace) -> int:
+    order_no = args.order.strip()
+    if not order_no:
+        print("调拨单号去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    with Ledger.open(db_path) as ledger:
+        try:
+            record = ledger.cancel_transfer(order_no)
+        except (TransferError, sqlite3.IntegrityError) as exc:
+            print(f"取消失败：{exc}", file=sys.stderr)
+            return 1
+
+    print(
+        f"取消成功：调拨单号={record.order_no} "
+        f"来源仓={record.source_warehouse} "
+        f"目标仓={record.target_warehouse} 商品={record.product} "
+        f"状态={record.status} 实收数量={record.received_quantity} "
+        f"批次数={len(record.items)}"
+    )
+    return 0
+
+
 def _run_split(args: argparse.Namespace) -> int:
     warehouse = args.warehouse.strip()
     product = args.product.strip()
@@ -1007,6 +1051,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_transfer_query(args)
     if args.command == "receive":
         return _run_receive(args)
+    if args.command == "cancel":
+        return _run_cancel(args)
     if args.command == "split":
         return _run_split(args)
     if args.command == "merge":
