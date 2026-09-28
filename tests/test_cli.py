@@ -1591,5 +1591,327 @@ class AdjustCommandTests(unittest.TestCase):
         self.assertIn("adjust-query", result.stdout)
 
 
+class ReconcileQueryTests(unittest.TestCase):
+    def invoke_in(self, cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "stock_transfer", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+
+    def seed(self, cwd: Path, db: str) -> None:
+        # WH-A holds two lots of SKU-1001; WH-B holds one lot.
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-A", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-1,2024-03-01,2025-03-01,100",
+            "--batch", "LOT-2,2024-04-02,2025-04-02,100",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.invoke_in(
+            cwd,
+            "register", "--warehouse", "WH-B", "--product", "SKU-1001",
+            "--db", db,
+            "--batch", "LOT-9,2024-01-01,2025-01-01,50",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_all_statuses_ordering_scope_and_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+
+            # TR-001: in transit, dispatched 10+4=14.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-001", "--from", "WH-A",
+                    "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                    "--item", "LOT-1,10", "--item", "LOT-2,4",
+                ).returncode, 0
+            )
+            # TR-002: received in full, dispatched 20.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-002", "--from", "WH-A",
+                    "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                    "--item", "LOT-1,20",
+                ).returncode, 0
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "receive", "--order", "TR-002", "--db", db,
+                    "--received", "LOT-1,20",
+                ).returncode, 0
+            )
+            # TR-003: received short, dispatched 30 / received 25.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-003", "--from", "WH-A",
+                    "--to", "WH-C", "--product", "SKU-1001", "--db", db,
+                    "--item", "LOT-1,30",
+                ).returncode, 0
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "receive", "--order", "TR-003", "--db", db,
+                    "--received", "LOT-1,25",
+                ).returncode, 0
+            )
+            # TR-004: cancelled, dispatched 5.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-004", "--from", "WH-A",
+                    "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                    "--item", "LOT-2,5",
+                ).returncode, 0
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "cancel", "--order", "TR-004", "--db", db
+                ).returncode, 0
+            )
+            # TR-005: WH-B -> WH-A, matches WH-A only as target.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-005", "--from", "WH-B",
+                    "--to", "WH-A", "--product", "SKU-1001", "--db", db,
+                    "--item", "LOT-9,7",
+                ).returncode, 0
+            )
+            # TR-006: WH-B -> WH-C, out of WH-A scope.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-006", "--from", "WH-B",
+                    "--to", "WH-C", "--product", "SKU-1001", "--db", db,
+                    "--item", "LOT-9,2",
+                ).returncode, 0
+            )
+            # TR-007: WH-A -> WH-B but a different product, out of product scope.
+            self.assertEqual(
+                self.invoke_in(
+                    cwd,
+                    "register", "--warehouse", "WH-A", "--product", "SKU-2",
+                    "--db", db,
+                    "--batch", "X-1,2024-01-01,2025-01-01,9",
+                ).returncode, 0
+            )
+            self.assertEqual(
+                self.invoke_in(
+                    cwd, "transfer", "--order", "TR-007", "--from", "WH-A",
+                    "--to", "WH-B", "--product", "SKU-2", "--db", db,
+                    "--item", "X-1,1",
+                ).returncode, 0
+            )
+
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", " WH-A ",
+                "--product", " SKU-1001 ", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            lines = result.stdout.splitlines()
+            self.assertEqual(lines[0], "仓库=WH-A 商品=SKU-1001 调拨单数=5")
+            self.assertEqual(len(lines), 6)
+
+            self.assertEqual(
+                lines[1],
+                "调拨单号=TR-001 来源仓=WH-A 目标仓=WH-B 商品=SKU-1001 "
+                "状态=in_transit 调出总数=14 实收总数=0 差异状态=未结清",
+            )
+            self.assertEqual(
+                lines[2],
+                "调拨单号=TR-002 来源仓=WH-A 目标仓=WH-B 商品=SKU-1001 "
+                "状态=received 调出总数=20 实收总数=20 差异状态=已结清",
+            )
+            self.assertEqual(
+                lines[3],
+                "调拨单号=TR-003 来源仓=WH-A 目标仓=WH-C 商品=SKU-1001 "
+                "状态=received 调出总数=30 实收总数=25 差异状态=收货差异未结清",
+            )
+            self.assertEqual(
+                lines[4],
+                "调拨单号=TR-004 来源仓=WH-A 目标仓=WH-B 商品=SKU-1001 "
+                "状态=cancelled 调出总数=5 实收总数=0 差异状态=已退回结清",
+            )
+            self.assertEqual(
+                lines[5],
+                "调拨单号=TR-005 来源仓=WH-B 目标仓=WH-A 商品=SKU-1001 "
+                "状态=in_transit 调出总数=7 实收总数=0 差异状态=未结清",
+            )
+            # Out-of-scope orders never appear.
+            self.assertNotIn("TR-006", result.stdout)
+            self.assertNotIn("TR-007", result.stdout)
+
+    def test_target_side_query_dedupes_and_is_ordered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            # One order whose source equals its query target side, and one
+            # whose target does; each order number appears exactly once.
+            self.invoke_in(
+                cwd, "transfer", "--order", "TR-100", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,3",
+            )
+            self.invoke_in(
+                cwd, "transfer", "--order", "TR-101", "--from", "WH-B",
+                "--to", "WH-A", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-9,2",
+            )
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-B",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.count("TR-100"), 1)
+            self.assertEqual(result.stdout.count("TR-101"), 1)
+            self.assertIn("调拨单数=2", result.stdout)
+            # Registration order, not grouped by source/target.
+            self.assertLess(
+                result.stdout.index("TR-100"), result.stdout.index("TR-101")
+            )
+
+    def test_empty_scope_returns_empty_list_with_zero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-Z",
+                "--product", "SKU-9", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout, "仓库=WH-Z 商品=SKU-9 调拨单数=0\n"
+            )
+
+    def test_missing_db_returns_empty_list_without_creating_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = cwd / "ledger.db"
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", str(db)
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("调拨单数=0", result.stdout)
+            self.assertFalse(db.exists())
+
+    def test_blank_codes_rejected_without_reconciliation_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "  ",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("仓库代码", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-A",
+                "--product", "   ", "--db", db
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("商品代码", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_query_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            self.invoke_in(
+                cwd, "transfer", "--order", "TR-001", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,10",
+            )
+            self.invoke_in(
+                cwd, "transfer", "--order", "TR-002", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-2,4",
+            )
+            self.invoke_in(
+                cwd, "receive", "--order", "TR-002", "--db", db,
+                "--received", "LOT-2,3",
+            )
+
+            def snapshot() -> tuple:
+                with sqlite3.connect(db) as conn:
+                    return (
+                        conn.execute(
+                            "SELECT order_no,status,received_quantity "
+                            "FROM transfers ORDER BY id"
+                        ).fetchall(),
+                        conn.execute(
+                            "SELECT transfer_id,lot,quantity,received_quantity "
+                            "FROM transfer_items ORDER BY id"
+                        ).fetchall(),
+                        conn.execute(
+                            "SELECT warehouse,lot,quantity FROM stock_batches "
+                            "ORDER BY id"
+                        ).fetchall(),
+                    )
+
+            before = snapshot()
+            result = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(snapshot(), before)
+
+            # The underlying orders still read back identically.
+            order = self.invoke_in(
+                cwd, "transfer-query", "--order", "TR-002", "--db", db
+            )
+            self.assertIn("状态=received", order.stdout)
+            self.assertIn("实收数量=3", order.stdout)
+            self.assertIn("批次号=LOT-2 调出数量=4 实收数量=3", order.stdout)
+
+    def test_persists_across_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            db = str(cwd / "ledger.db")
+            self.seed(cwd, db)
+            self.invoke_in(
+                cwd, "transfer", "--order", "TR-001", "--from", "WH-A",
+                "--to", "WH-B", "--product", "SKU-1001", "--db", db,
+                "--item", "LOT-1,6",
+            )
+            first = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            second = self.invoke_in(
+                cwd, "reconcile-query", "--warehouse", "WH-A",
+                "--product", "SKU-1001", "--db", db
+            )
+            self.assertEqual(first.returncode, 0)
+            self.assertEqual(second.returncode, 0)
+            self.assertEqual(first.stdout, second.stdout)
+            self.assertIn("调出总数=6", second.stdout)
+
+    def test_help_mentions_reconcile_query(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "stock_transfer", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=ENV,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("reconcile-query", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

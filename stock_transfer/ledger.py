@@ -18,6 +18,12 @@ TRANSFER_STATUSES = (
     TRANSFER_CANCELLED,
 )
 
+# Fixed public contract for transfer reconciliation results.
+RECONCILE_SETTLED = "已结清"
+RECONCILE_RECEIPT_DISCREPANCY = "收货差异未结清"
+RECONCILE_RETURNED = "已退回结清"
+RECONCILE_UNSETTLED = "未结清"
+
 
 @dataclass(frozen=True)
 class BatchInput:
@@ -89,6 +95,45 @@ class AdjustmentRecord:
     before_quantity: int
     after_quantity: int
     delta: int
+
+
+@dataclass(frozen=True)
+class TransferReconciliationRecord:
+    """One transfer order as a reconciliation row.
+
+    ``dispatched_quantity`` is the sum of the order's allocation-line
+    dispatched quantities; ``received_quantity`` is the order's recorded
+    received total. ``discrepancy_status`` follows the fixed public
+    contract (see ``reconciliation_status``).
+    """
+
+    order_no: str
+    source_warehouse: str
+    target_warehouse: str
+    product: str
+    status: str
+    dispatched_quantity: int
+    received_quantity: int
+    discrepancy_status: str
+
+
+def reconciliation_status(
+    status: str, dispatched_quantity: int, received_quantity: int
+) -> str:
+    """Classify one order's reconciliation result by its status.
+
+    The rule is a fixed public contract: ``received`` with received total
+    equal to dispatched total is settled; ``received`` with received total
+    below dispatched total is an unsettled receipt discrepancy;
+    ``cancelled`` is settled by return; ``in_transit`` is unsettled.
+    """
+    if status == TRANSFER_RECEIVED:
+        if received_quantity == dispatched_quantity:
+            return RECONCILE_SETTLED
+        return RECONCILE_RECEIPT_DISCREPANCY
+    if status == TRANSFER_CANCELLED:
+        return RECONCILE_RETURNED
+    return RECONCILE_UNSETTLED
 
 
 class TransferError(Exception):
@@ -405,6 +450,51 @@ class Ledger:
         return TransferRecord(
             order_no, source, target, product, status, received, items
         )
+
+    def list_transfer_reconciliations(
+        self, warehouse: str, product: str
+    ) -> list[TransferReconciliationRecord]:
+        """Return reconciliation rows for every transfer order in scope.
+
+        Scope is all orders whose product matches and whose source *or*
+        target warehouse matches; an order matching both sides still
+        appears exactly once. Rows come back in registration order
+        (transfer id). The dispatched total is the sum of the order's
+        allocation-line quantities and the received total is the order's
+        recorded received quantity. Read-only: nothing is mutated.
+        """
+        rows = self._conn.execute(
+            "SELECT t.order_no, t.source_warehouse, t.target_warehouse, "
+            "t.product, t.status, t.received_quantity, "
+            "(SELECT COALESCE(SUM(ti.quantity), 0) FROM transfer_items ti "
+            "WHERE ti.transfer_id = t.id) AS dispatched_quantity "
+            "FROM transfers t "
+            "WHERE t.product = ? AND "
+            "(t.source_warehouse = ? OR t.target_warehouse = ?) "
+            "ORDER BY t.id",
+            (product, warehouse, warehouse),
+        )
+        return [
+            TransferReconciliationRecord(
+                order_no,
+                source,
+                target,
+                order_product,
+                status,
+                dispatched,
+                received,
+                reconciliation_status(status, dispatched, received),
+            )
+            for (
+                order_no,
+                source,
+                target,
+                order_product,
+                status,
+                received,
+                dispatched,
+            ) in rows
+        ]
 
     def confirm_receipt(
         self,

@@ -20,6 +20,7 @@ from .ledger import (
     SplitPieceInput,
     TransferError,
     TransferItemInput,
+    TransferReconciliationRecord,
     TransferRecord,
 )
 
@@ -306,6 +307,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "      --from WH-A --to WH-B --product SKU-1001 \\\n"
             "      --item LOT-2024-001,10\n"
             "  python3 -m stock_transfer transfer-query --order TR-001\n"
+            "  python3 -m stock_transfer reconcile-query --warehouse WH-A "
+            "--product SKU-1001\n"
             "  python3 -m stock_transfer receive --order TR-001 \\\n"
             "      --received LOT-2024-001,9 --received LOT-2024-002,4\n"
             "  python3 -m stock_transfer cancel --order TR-001\n"
@@ -397,6 +400,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     transfer_query.add_argument("--order", required=True, help="调拨单号")
     transfer_query.add_argument(
+        "--db",
+        default=None,
+        help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
+    )
+
+    reconcile_query = subparsers.add_parser(
+        "reconcile-query",
+        help="按仓库与商品查询该范围内全部调拨单的对账结果（按登记先后顺序）",
+        description=(
+            "只读查询，不改动任何记录。范围为商品相同且来源仓或目标仓等于该仓库的"
+            "全部调拨单（同一单即使两侧都匹配也只出现一次），按单据登记先后顺序输出。"
+            "每单给出调拨单号、来源仓、目标仓、商品、状态、调出总数、实收总数与"
+            "差异状态：received 且实收等于调出为“已结清”，received 且实收小于调出为"
+            "“收货差异未结清”，cancelled 为“已退回结清”，in_transit 为“未结清”。"
+        ),
+    )
+    reconcile_query.add_argument("--warehouse", required=True, help="仓库代码")
+    reconcile_query.add_argument("--product", required=True, help="商品代码")
+    reconcile_query.add_argument(
         "--db",
         default=None,
         help="台账数据文件路径（默认当前工作目录下的 stock_ledger.db）",
@@ -738,6 +760,39 @@ def _run_transfer_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_reconciliation(record: TransferReconciliationRecord) -> None:
+    print(
+        f"调拨单号={record.order_no} 来源仓={record.source_warehouse} "
+        f"目标仓={record.target_warehouse} 商品={record.product} "
+        f"状态={record.status} 调出总数={record.dispatched_quantity} "
+        f"实收总数={record.received_quantity} "
+        f"差异状态={record.discrepancy_status}"
+    )
+
+
+def _run_reconcile_query(args: argparse.Namespace) -> int:
+    warehouse = args.warehouse.strip()
+    product = args.product.strip()
+    if not warehouse:
+        print("仓库代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+    if not product:
+        print("商品代码去首尾空白后不能为空", file=sys.stderr)
+        return 1
+
+    db_path = _db_path(args)
+    if not db_path.exists():
+        records = []
+    else:
+        with Ledger.open(db_path) as ledger:
+            records = ledger.list_transfer_reconciliations(warehouse, product)
+
+    print(f"仓库={warehouse} 商品={product} 调拨单数={len(records)}")
+    for record in records:
+        _print_reconciliation(record)
+    return 0
+
+
 def _run_receive(args: argparse.Namespace) -> int:
     order_no = args.order.strip()
     if not order_no:
@@ -1049,6 +1104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_transfer(args)
     if args.command == "transfer-query":
         return _run_transfer_query(args)
+    if args.command == "reconcile-query":
+        return _run_reconcile_query(args)
     if args.command == "receive":
         return _run_receive(args)
     if args.command == "cancel":
